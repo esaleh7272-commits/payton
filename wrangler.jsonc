@@ -1,0 +1,20 @@
+{
+  "name": "paytonpresale",
+  "main": "worker.js",
+  "compatibility_date": "2026-09-19",
+  "compatibility_flags": [
+    "nodejs_compat"
+  ],
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "payton",
+      "database_id": "92029161-d703-4a17-b61d-8121b35e3e02"
+    }
+  ],
+  "triggers": {
+    "crons": [
+      "* * * * *"
+    ]
+  }
+}
