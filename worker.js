@@ -1,6 +1,12 @@
 import { Buffer } from "buffer";
+import {
+  pbkdf2_sha512,
+  deriveEd25519Path,
+  keyPairFromSeed,
+  mnemonicWordList
+} from "@ton/crypto";
+
 import { WalletContractV5R1 } from "@ton/ton";
-import { mnemonicToPrivateKey } from "@ton/crypto";
 
 globalThis.Buffer = Buffer;
 globalThis.window = globalThis;
@@ -14,8 +20,9 @@ export default {
     const url = new URL(request.url);
 
     // ==========================================
-    // TEMPORARY WALLET DERIVATION TEST
-    // NO TRANSACTION / NO PTN TRANSFER
+    // TEMPORARY MULTICHAIN WALLET TEST
+    // NO TRANSACTION
+    // NO PTN TRANSFER
     // ==========================================
 
     if (
@@ -24,73 +31,134 @@ export default {
     ) {
       try {
 
-        // Check Secret
         if (!env.PTN_MNEMONIC) {
           return new Response(
             "ERROR: PTN_MNEMONIC secret is missing"
           );
         }
 
-        // Read mnemonic
         const words = env.PTN_MNEMONIC
           .trim()
           .split(/\s+/)
-          .filter(Boolean);
+          .map(w => w.toLowerCase());
 
-        // Check word count
         if (words.length !== 12 && words.length !== 24) {
           return new Response(
             "ERROR: mnemonic word count = " + words.length
           );
         }
 
-        // Derive private/public key
-        let keyPair;
+        // ==========================================
+        // Convert BIP39 words -> entropy
+        // ==========================================
 
-        try {
-          keyPair = await mnemonicToPrivateKey(words);
-        } catch (error) {
-          return new Response(
-            "ERROR at mnemonicToPrivateKey: " +
-            (error?.message || String(error))
+        const indexes = [];
+
+        for (const word of words) {
+          const index = mnemonicWordList.indexOf(word);
+
+          if (index === -1) {
+            return new Response(
+              "ERROR: invalid mnemonic word"
+            );
+          }
+
+          indexes.push(index);
+        }
+
+        let bits = "";
+
+        for (const index of indexes) {
+          bits += index.toString(2).padStart(11, "0");
+        }
+
+        // BIP39 entropy length:
+        // 12 words = 128 bits
+        // 24 words = 256 bits
+
+        const entropyBits =
+          words.length === 12 ? 128 : 256;
+
+        bits = bits.slice(0, entropyBits);
+
+        const entropy = Buffer.alloc(
+          entropyBits / 8
+        );
+
+        for (let i = 0; i < entropy.length; i++) {
+          entropy[i] = parseInt(
+            bits.slice(i * 8, i * 8 + 8),
+            2
           );
         }
 
-        // Create V5R1 wallet
-        let wallet;
+        // ==========================================
+        // BIP39 seed
+        //
+        // PBKDF2-HMAC-SHA512
+        // password = mnemonic entropy
+        // salt = "mnemonic"
+        // iterations = 2048
+        // output = 64 bytes
+        // ==========================================
 
-        try {
-          wallet = WalletContractV5R1.create({
+        const normalizedPassphrase = "";
+
+        const salt = Buffer.from(
+          "mnemonic" + normalizedPassphrase,
+          "utf8"
+        );
+
+        const bip39Seed = await pbkdf2_sha512(
+          entropy,
+          salt,
+          2048,
+          64
+        );
+
+        // ==========================================
+        // SLIP-0010 Ed25519
+        //
+        // m/44'/607'/0'
+        // ==========================================
+
+        const derivedSeed =
+          await deriveEd25519Path(
+            bip39Seed,
+            [44, 607, 0]
+          );
+
+        // ==========================================
+        // Create Ed25519 key pair
+        // ==========================================
+
+        const keyPair =
+          keyPairFromSeed(derivedSeed);
+
+        // ==========================================
+        // Create TON V5R1 Mainnet wallet
+        // ==========================================
+
+        const wallet =
+          WalletContractV5R1.create({
             walletId: {
               networkGlobalId: -239
             },
             publicKey: keyPair.publicKey,
             workchain: 0
           });
-        } catch (error) {
-          return new Response(
-            "ERROR at WalletContractV5R1.create: " +
-            (error?.message || String(error))
-          );
-        }
 
-        // Convert derived address
-        let derivedAddress;
-
-        try {
-          derivedAddress = wallet.address.toString({
+        const derivedAddress =
+          wallet.address.toString({
             urlSafe: true,
             bounceable: true,
             testOnly: false
           });
-        } catch (error) {
-          return new Response(
-            "ERROR at address conversion: " +
-            (error?.message || String(error))
-          );
-        }
 
-        // Compare with PTN sender wallet
+        // ==========================================
+        // Compare addresses
+        // ==========================================
+
         if (derivedAddress === EXPECTED_WALLET) {
           return new Response("MATCH");
         }
@@ -106,6 +174,8 @@ export default {
       }
     }
 
-    return new Response("PAYTON Wallet Test is running!");
+    return new Response(
+      "PAYTON Multichain Wallet Test is running!"
+    );
   }
 };
