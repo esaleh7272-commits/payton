@@ -3,6 +3,7 @@ import { WalletContractV5R1 } from "@ton/ton";
 import { mnemonicToPrivateKey } from "@ton/crypto";
 
 globalThis.Buffer = Buffer;
+globalThis.window = globalThis;
 
 const EXPECTED_WALLET =
   "UQD9eW663lS-7SeGVyYK_cQlKBSjzWSbxaBkgUTigTjZ9Hh6";
@@ -12,29 +13,38 @@ export default {
 
     const url = new URL(request.url);
 
+    // ==========================================
+    // TEMPORARY WALLET DERIVATION TEST
+    // NO TRANSACTION / NO PTN TRANSFER
+    // ==========================================
+
     if (
       request.method === "GET" &&
       url.pathname === "/__wallet_check_payton_739182"
     ) {
       try {
 
+        // Check Secret
         if (!env.PTN_MNEMONIC) {
           return new Response(
             "ERROR: PTN_MNEMONIC secret is missing"
           );
         }
 
+        // Read mnemonic
         const words = env.PTN_MNEMONIC
           .trim()
           .split(/\s+/)
           .filter(Boolean);
 
+        // Check word count
         if (words.length !== 12 && words.length !== 24) {
           return new Response(
             "ERROR: mnemonic word count = " + words.length
           );
         }
 
+        // Derive private/public key
         let keyPair;
 
         try {
@@ -46,6 +56,7 @@ export default {
           );
         }
 
+        // Create V5R1 wallet
         let wallet;
 
         try {
@@ -63,18 +74,15 @@ export default {
           );
         }
 
+        // Convert derived address
+        let derivedAddress;
+
         try {
-          const derivedAddress = wallet.address.toString({
+          derivedAddress = wallet.address.toString({
             urlSafe: true,
             bounceable: true,
             testOnly: false
           });
-
-          if (derivedAddress === EXPECTED_WALLET) {
-            return new Response("MATCH");
-          }
-
-          return new Response("MISMATCH");
         } catch (error) {
           return new Response(
             "ERROR at address conversion: " +
@@ -82,7 +90,15 @@ export default {
           );
         }
 
+        // Compare with PTN sender wallet
+        if (derivedAddress === EXPECTED_WALLET) {
+          return new Response("MATCH");
+        }
+
+        return new Response("MISMATCH");
+
       } catch (error) {
+
         return new Response(
           "ERROR: " +
           (error?.message || String(error))
