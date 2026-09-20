@@ -1,8 +1,24 @@
+import { Buffer } from "buffer";
+
+globalThis.Buffer = Buffer;
+
+import {
+  WalletContractV4,
+  WalletContractV5R1,
+  WalletContractV3R2
+} from "@ton/ton";
+
+import {
+  mnemonicToPrivateKey,
+  deriveEd25519Path,
+  keyPairFromSeed
+} from "@ton/crypto";
+
 const TARGET =
   "UQD9eW663lS-7SeGVyYK_cQlKBSjzWSbxaBkgUTigTjZ9Hh6";
 
 const CHECK_PATH =
-  "/__wallet_type_check_739182";
+  "/__wallet_derivation_check_739182";
 
 export default {
   async fetch(request, env) {
@@ -12,111 +28,321 @@ export default {
       request.method === "GET" &&
       url.pathname === CHECK_PATH
     ) {
-      try {
-        if (!env.TONCENTER_API_KEY) {
-          return new Response(
-            "ERROR: TONCENTER_API_KEY secret is missing",
-            { status: 500 }
-          );
-        }
-
-        const apiUrl =
-          "https://toncenter.com/api/v2/getWalletInformation" +
-          "?address=" +
-          encodeURIComponent(TARGET);
-
-        const response = await fetch(apiUrl, {
-          method: "GET",
-          headers: {
-            "X-API-Key": env.TONCENTER_API_KEY
-          }
-        });
-
-        const data = await response.json();
-
-        if (!response.ok || !data.ok) {
-          return new Response(
-            "TONCENTER ERROR\n\n" +
-            JSON.stringify(data, null, 2),
-            { status: 500 }
-          );
-        }
-
-        const result = data.result || {};
-
-        const wallet =
-          result.wallet === true;
-
-        const walletType =
-          result.wallet_type || "unknown";
-
-        const walletId =
-          result.wallet_id !== undefined
-            ? String(result.wallet_id)
-            : "unknown";
-
-        const seqno =
-          result.seqno !== undefined
-            ? String(result.seqno)
-            : "unknown";
-
-        const accountState =
-          result.account_state || "unknown";
-
-        const balance =
-          result.balance !== undefined
-            ? String(result.balance)
-            : "unknown";
-
-        return new Response(
-`PAYTON WALLET CHECK
-
-Address:
-${TARGET}
-
-Wallet:
-${wallet}
-
-Wallet type:
-${walletType}
-
-Wallet ID:
-${walletId}
-
-Seqno:
-${seqno}
-
-Account state:
-${accountState}
-
-Balance:
-${balance}
-
-No transaction was sent.
-No mnemonic was used.`,
-          {
-            headers: {
-              "Content-Type":
-                "text/plain; charset=UTF-8"
-            }
-          }
-        );
-
-      } catch (error) {
-        console.error(error);
-
-        return new Response(
-          "ERROR\n\n" +
-          String(
-            error?.message || error
-          ),
-          { status: 500 }
-        );
-      }
+      return runWalletCheck(env);
     }
 
     return new Response(
-      "PAYTON wallet check is running!"
+      "PAYTON wallet derivation check is running!"
     );
   }
 };
+
+async function runWalletCheck(env) {
+  try {
+    if (!env.PTN_MNEMONIC) {
+      return new Response(
+        "ERROR: PTN_MNEMONIC secret is missing",
+        { status: 500 }
+      );
+    }
+
+    const words = env.PTN_MNEMONIC
+      .trim()
+      .split(/\s+/);
+
+    const results = [];
+
+    results.push(
+      await testTONMnemonic(words)
+    );
+
+    results.push(
+      await testBIP39Mnemonic(words)
+    );
+
+    let output =
+`PAYTON WALLET DERIVATION CHECK
+
+Target:
+${TARGET}
+
+Word count:
+${words.length}
+
+--------------------------------
+TON MNEMONIC
+--------------------------------
+
+`;
+
+    output += formatResults(results[0]);
+
+    output +=
+`
+
+--------------------------------
+BIP39 MULTICHAIN
+--------------------------------
+
+`;
+
+    output += formatResults(results[1]);
+
+    const matches = [];
+
+    for (const group of results) {
+      for (const item of group.items) {
+        if (item.match) {
+          matches.push(
+            group.name +
+            " -> " +
+            item.wallet
+          );
+        }
+      }
+    }
+
+    output +=
+`
+
+--------------------------------
+FINAL RESULT
+--------------------------------
+
+`;
+
+    if (matches.length > 0) {
+      output +=
+`MATCH FOUND
+
+${matches.join("\n")}
+
+The target address matches one of the tested derivation methods.
+`;
+
+    } else {
+      output +=
+`NO MATCH FOUND
+
+None of the tested combinations produced the target address.
+
+No transaction was sent.
+No mnemonic was displayed.
+`;
+    }
+
+    return new Response(
+      output,
+      {
+        headers: {
+          "Content-Type":
+            "text/plain; charset=UTF-8"
+        }
+      }
+    );
+
+  } catch (error) {
+    console.error(error);
+
+    return new Response(
+      "ERROR\n\n" +
+      String(
+        error?.message || error
+      ),
+      { status: 500 }
+    );
+  }
+}
+
+async function testTONMnemonic(words) {
+  const group = {
+    name: "TON MNEMONIC",
+    items: []
+  };
+
+  try {
+    const keyPair =
+      await mnemonicToPrivateKey(words);
+
+    addWalletResult(
+      group,
+      "V5R1",
+      createV5(keyPair.publicKey)
+    );
+
+    addWalletResult(
+      group,
+      "V4R2",
+      createV4(keyPair.publicKey)
+    );
+
+    addWalletResult(
+      group,
+      "V3R2",
+      createV3(keyPair.publicKey)
+    );
+
+  } catch (error) {
+    group.error =
+      String(error?.message || error);
+  }
+
+  return group;
+}
+
+async function testBIP39Mnemonic(words) {
+  const group = {
+    name: "BIP39 MULTICHAIN",
+    items: []
+  };
+
+  try {
+    const seed =
+      await bip39Seed(words);
+
+    const derivedSeed =
+      await deriveEd25519Path(
+        seed,
+        [44, 607, 0]
+      );
+
+    const keyPair =
+      keyPairFromSeed(derivedSeed);
+
+    addWalletResult(
+      group,
+      "V5R1",
+      createV5(keyPair.publicKey)
+    );
+
+    addWalletResult(
+      group,
+      "V4R2",
+      createV4(keyPair.publicKey)
+    );
+
+    addWalletResult(
+      group,
+      "V3R2",
+      createV3(keyPair.publicKey)
+    );
+
+  } catch (error) {
+    group.error =
+      String(error?.message || error);
+  }
+
+  return group;
+}
+
+function createV5(publicKey) {
+  return WalletContractV5R1.create({
+    walletId: {
+      networkGlobalId: -239
+    },
+    publicKey,
+    workchain: 0
+  });
+}
+
+function createV4(publicKey) {
+  return WalletContractV4.create({
+    workchain: 0,
+    publicKey,
+    walletId: 0x29a9a317
+  });
+}
+
+function createV3(publicKey) {
+  return WalletContractV3R2.create({
+    workchain: 0,
+    publicKey,
+    walletId: 0
+  });
+}
+
+function addWalletResult(
+  group,
+  wallet,
+  contract
+) {
+  const address =
+    contract.address.toString({
+      bounceable: false,
+      urlSafe: true
+    });
+
+  group.items.push({
+    wallet,
+    address,
+    match: address === TARGET
+  });
+}
+
+function formatResults(group) {
+  let text = "";
+
+  if (group.error) {
+    text +=
+`ERROR:
+${group.error}
+`;
+
+    return text;
+  }
+
+  for (const item of group.items) {
+    text +=
+`${item.wallet}
+${item.address}
+
+`;
+
+    if (item.match) {
+      text +=
+"*** MATCH ***\n\n";
+    }
+  }
+
+  return text;
+}
+
+async function bip39Seed(words) {
+  const mnemonic =
+    words.join(" ");
+
+  const password =
+    new TextEncoder().encode(
+      mnemonic.normalize("NFKD")
+    );
+
+  const salt =
+    new TextEncoder().encode(
+      "mnemonic"
+    );
+
+  const key =
+    await crypto.subtle.importKey(
+      "raw",
+      password,
+      {
+        name: "PBKDF2"
+      },
+      false,
+      ["deriveBits"]
+    );
+
+  const bits =
+    await crypto.subtle.deriveBits(
+      {
+        name: "PBKDF2",
+        hash: "SHA-512",
+        salt,
+        iterations: 2048
+      },
+      key,
+      512
+    );
+
+  return Buffer.from(bits);
+       }
