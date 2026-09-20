@@ -1,12 +1,14 @@
 import { Buffer } from "buffer";
 import {
-  pbkdf2_sha512,
+  mnemonicToPrivateKey,
   deriveEd25519Path,
-  keyPairFromSeed,
-  mnemonicWordList
+  keyPairFromSeed
 } from "@ton/crypto";
 
-import { WalletContractV5R1 } from "@ton/ton";
+import {
+  WalletContractV4,
+  WalletContractV5R1
+} from "@ton/ton";
 
 globalThis.Buffer = Buffer;
 globalThis.window = globalThis;
@@ -14,16 +16,19 @@ globalThis.window = globalThis;
 const EXPECTED_WALLET =
   "UQD9eW663lS-7SeGVyYK_cQlKBSjzWSbxaBkgUTigTjZ9Hh6";
 
+// =====================================================
+// TEMPORARY WALLET IDENTIFICATION TEST
+// =====================================================
+// NO TRANSACTION
+// NO TON TRANSFER
+// NO PTN TRANSFER
+// NO BROADCAST
+// =====================================================
+
 export default {
   async fetch(request, env) {
 
     const url = new URL(request.url);
-
-    // ==========================================
-    // TEMPORARY MULTICHAIN WALLET TEST
-    // NO TRANSACTION
-    // NO PTN TRANSFER
-    // ==========================================
 
     if (
       request.method === "GET" &&
@@ -31,16 +36,22 @@ export default {
     ) {
       try {
 
+        // -------------------------------------------------
+        // 1. Read Secret
+        // -------------------------------------------------
+
         if (!env.PTN_MNEMONIC) {
           return new Response(
             "ERROR: PTN_MNEMONIC secret is missing"
           );
         }
 
-        const words = env.PTN_MNEMONIC
-          .trim()
-          .split(/\s+/)
-          .map(w => w.toLowerCase());
+        const mnemonic =
+          env.PTN_MNEMONIC
+            .trim()
+            .replace(/\s+/g, " ");
+
+        const words = mnemonic.split(" ");
 
         if (words.length !== 12 && words.length !== 24) {
           return new Response(
@@ -48,122 +59,279 @@ export default {
           );
         }
 
-        // ==========================================
-        // Convert BIP39 words -> entropy
-        // ==========================================
+        // -------------------------------------------------
+        // 2. TON-NATIVE DERIVATION
+        // -------------------------------------------------
 
-        const indexes = [];
+        let tonKeyPair;
 
-        for (const word of words) {
-          const index = mnemonicWordList.indexOf(word);
+        try {
 
-          if (index === -1) {
-            return new Response(
-              "ERROR: invalid mnemonic word"
-            );
-          }
+          tonKeyPair =
+            await mnemonicToPrivateKey(words);
 
-          indexes.push(index);
-        }
+        } catch (error) {
 
-        let bits = "";
-
-        for (const index of indexes) {
-          bits += index.toString(2).padStart(11, "0");
-        }
-
-        // BIP39 entropy length:
-        // 12 words = 128 bits
-        // 24 words = 256 bits
-
-        const entropyBits =
-          words.length === 12 ? 128 : 256;
-
-        bits = bits.slice(0, entropyBits);
-
-        const entropy = Buffer.alloc(
-          entropyBits / 8
-        );
-
-        for (let i = 0; i < entropy.length; i++) {
-          entropy[i] = parseInt(
-            bits.slice(i * 8, i * 8 + 8),
-            2
+          return new Response(
+            "ERROR: TON mnemonic derivation failed: " +
+            (error?.message || String(error))
           );
         }
 
-        // ==========================================
-        // BIP39 seed
+        // -------------------------------------------------
+        // 3. TON-NATIVE V5R1
+        // -------------------------------------------------
+
+        let tonV5Address;
+
+        try {
+
+          const wallet =
+            WalletContractV5R1.create({
+              walletId: {
+                networkGlobalId: -239
+              },
+              publicKey: tonKeyPair.publicKey,
+              workchain: 0
+            });
+
+          tonV5Address =
+            wallet.address.toString({
+              urlSafe: true,
+              bounceable: true,
+              testOnly: false
+            });
+
+        } catch (error) {
+
+          return new Response(
+            "ERROR: TON V5R1 creation failed: " +
+            (error?.message || String(error))
+          );
+        }
+
+        // -------------------------------------------------
+        // 4. TON-NATIVE V4R2
+        // -------------------------------------------------
+
+        let tonV4Address;
+
+        try {
+
+          const wallet =
+            WalletContractV4.create({
+              workchain: 0,
+              publicKey: tonKeyPair.publicKey,
+              walletId: 0x29a9a317
+            });
+
+          tonV4Address =
+            wallet.address.toString({
+              urlSafe: true,
+              bounceable: true,
+              testOnly: false
+            });
+
+        } catch (error) {
+
+          return new Response(
+            "ERROR: TON V4R2 creation failed: " +
+            (error?.message || String(error))
+          );
+        }
+
+        // -------------------------------------------------
+        // 5. MULTICHAIN / BIP39
         //
+        // BIP39:
         // PBKDF2-HMAC-SHA512
-        // password = mnemonic entropy
-        // salt = "mnemonic"
-        // iterations = 2048
-        // output = 64 bytes
-        // ==========================================
+        //
+        // password = normalized mnemonic
+        // salt     = "mnemonic"
+        // rounds   = 2048
+        // output   = 64 bytes
+        // -------------------------------------------------
 
-        const normalizedPassphrase = "";
+        let bip39Seed;
 
-        const salt = Buffer.from(
-          "mnemonic" + normalizedPassphrase,
-          "utf8"
-        );
+        try {
 
-        const bip39Seed = await pbkdf2_sha512(
-          entropy,
-          salt,
-          2048,
-          64
-        );
+          const normalizedMnemonic =
+            mnemonic.normalize("NFKD");
 
-        // ==========================================
-        // SLIP-0010 Ed25519
+          const encoder =
+            new TextEncoder();
+
+          const mnemonicBytes =
+            encoder.encode(normalizedMnemonic);
+
+          const saltBytes =
+            encoder.encode("mnemonic");
+
+          const baseKey =
+            await crypto.subtle.importKey(
+              "raw",
+              mnemonicBytes,
+              "PBKDF2",
+              false,
+              ["deriveBits"]
+            );
+
+          const derivedBits =
+            await crypto.subtle.deriveBits(
+              {
+                name: "PBKDF2",
+                salt: saltBytes,
+                iterations: 2048,
+                hash: "SHA-512"
+              },
+              baseKey,
+              512
+            );
+
+          bip39Seed =
+            Buffer.from(
+              new Uint8Array(derivedBits)
+            );
+
+        } catch (error) {
+
+          return new Response(
+            "ERROR: BIP39 seed derivation failed: " +
+            (error?.message || String(error))
+          );
+        }
+
+        // -------------------------------------------------
+        // 6. MULTICHAIN SLIP-10
         //
         // m/44'/607'/0'
-        // ==========================================
+        //
+        // deriveEd25519Path() uses hardened Ed25519
+        // derivation for the supplied path.
+        // -------------------------------------------------
 
-        const derivedSeed =
-          await deriveEd25519Path(
-            bip39Seed,
-            [44, 607, 0]
+        let multichainKeyPair;
+
+        try {
+
+          const derivedSeed =
+            await deriveEd25519Path(
+              bip39Seed,
+              [44, 607, 0]
+            );
+
+          multichainKeyPair =
+            keyPairFromSeed(derivedSeed);
+
+        } catch (error) {
+
+          return new Response(
+            "ERROR: Multichain SLIP-10 derivation failed: " +
+            (error?.message || String(error))
           );
-
-        // ==========================================
-        // Create Ed25519 key pair
-        // ==========================================
-
-        const keyPair =
-          keyPairFromSeed(derivedSeed);
-
-        // ==========================================
-        // Create TON V5R1 Mainnet wallet
-        // ==========================================
-
-        const wallet =
-          WalletContractV5R1.create({
-            walletId: {
-              networkGlobalId: -239
-            },
-            publicKey: keyPair.publicKey,
-            workchain: 0
-          });
-
-        const derivedAddress =
-          wallet.address.toString({
-            urlSafe: true,
-            bounceable: true,
-            testOnly: false
-          });
-
-        // ==========================================
-        // Compare addresses
-        // ==========================================
-
-        if (derivedAddress === EXPECTED_WALLET) {
-          return new Response("MATCH");
         }
 
-        return new Response("MISMATCH");
+        // -------------------------------------------------
+        // 7. MULTICHAIN V5R1
+        // -------------------------------------------------
+
+        let multiV5Address;
+
+        try {
+
+          const wallet =
+            WalletContractV5R1.create({
+              walletId: {
+                networkGlobalId: -239
+              },
+              publicKey:
+                multichainKeyPair.publicKey,
+              workchain: 0
+            });
+
+          multiV5Address =
+            wallet.address.toString({
+              urlSafe: true,
+              bounceable: true,
+              testOnly: false
+            });
+
+        } catch (error) {
+
+          return new Response(
+            "ERROR: Multichain V5R1 creation failed: " +
+            (error?.message || String(error))
+          );
+        }
+
+        // -------------------------------------------------
+        // 8. MULTICHAIN V4R2
+        // -------------------------------------------------
+
+        let multiV4Address;
+
+        try {
+
+          const wallet =
+            WalletContractV4.create({
+              workchain: 0,
+              publicKey:
+                multichainKeyPair.publicKey,
+              walletId: 0x29a9a317
+            });
+
+          multiV4Address =
+            wallet.address.toString({
+              urlSafe: true,
+              bounceable: true,
+              testOnly: false
+            });
+
+        } catch (error) {
+
+          return new Response(
+            "ERROR: Multichain V4R2 creation failed: " +
+            (error?.message || String(error))
+          );
+        }
+
+        // -------------------------------------------------
+        // 9. COMPARE
+        // -------------------------------------------------
+
+        const matches = [];
+
+        if (tonV5Address === EXPECTED_WALLET) {
+          matches.push("TON-V5R1");
+        }
+
+        if (tonV4Address === EXPECTED_WALLET) {
+          matches.push("TON-V4R2");
+        }
+
+        if (multiV5Address === EXPECTED_WALLET) {
+          matches.push("MULTICHAIN-V5R1");
+        }
+
+        if (multiV4Address === EXPECTED_WALLET) {
+          matches.push("MULTICHAIN-V4R2");
+        }
+
+        // -------------------------------------------------
+        // 10. RETURN ONLY SAFE RESULT
+        // -------------------------------------------------
+
+        if (matches.length > 0) {
+
+          return new Response(
+            "MATCH: " + matches.join(", ")
+          );
+        }
+
+        return new Response(
+          "MISMATCH: ALL TESTS"
+        );
 
       } catch (error) {
 
@@ -175,7 +343,7 @@ export default {
     }
 
     return new Response(
-      "PAYTON Multichain Wallet Test is running!"
+      "PAYTON Wallet Identification Test is running!"
     );
   }
 };
