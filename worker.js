@@ -1,6 +1,7 @@
 import { Buffer } from "buffer";
 
 globalThis.Buffer = Buffer;
+globalThis.window = globalThis;
 
 import {
   WalletContractV4,
@@ -50,15 +51,11 @@ async function runWalletCheck(env) {
       .trim()
       .split(/\s+/);
 
-    const results = [];
+    const tonResult =
+      await testTONMnemonic(words);
 
-    results.push(
-      await testTONMnemonic(words)
-    );
-
-    results.push(
-      await testBIP39Mnemonic(words)
-    );
+    const bip39Result =
+      await testBIP39Mnemonic(words);
 
     let output =
 `PAYTON WALLET DERIVATION CHECK
@@ -75,7 +72,7 @@ TON MNEMONIC
 
 `;
 
-    output += formatResults(results[0]);
+    output += formatResults(tonResult);
 
     output +=
 `
@@ -86,19 +83,23 @@ BIP39 MULTICHAIN
 
 `;
 
-    output += formatResults(results[1]);
+    output += formatResults(bip39Result);
 
     const matches = [];
 
-    for (const group of results) {
-      for (const item of group.items) {
-        if (item.match) {
-          matches.push(
-            group.name +
-            " -> " +
-            item.wallet
-          );
-        }
+    for (const item of tonResult.items || []) {
+      if (item.match) {
+        matches.push(
+          "TON MNEMONIC -> " + item.wallet
+        );
+      }
+    }
+
+    for (const item of bip39Result.items || []) {
+      if (item.match) {
+        matches.push(
+          "BIP39 MULTICHAIN -> " + item.wallet
+        );
       }
     }
 
@@ -117,14 +118,13 @@ FINAL RESULT
 
 ${matches.join("\n")}
 
-The target address matches one of the tested derivation methods.
+The target address matches a tested derivation method.
 `;
-
     } else {
       output +=
 `NO MATCH FOUND
 
-None of the tested combinations produced the target address.
+The tested derivation methods did not produce the target address.
 
 No transaction was sent.
 No mnemonic was displayed.
@@ -146,9 +146,7 @@ No mnemonic was displayed.
 
     return new Response(
       "ERROR\n\n" +
-      String(
-        error?.message || error
-      ),
+      String(error?.message || error),
       { status: 500 }
     );
   }
@@ -156,7 +154,6 @@ No mnemonic was displayed.
 
 async function testTONMnemonic(words) {
   const group = {
-    name: "TON MNEMONIC",
     items: []
   };
 
@@ -192,7 +189,6 @@ async function testTONMnemonic(words) {
 
 async function testBIP39Mnemonic(words) {
   const group = {
-    name: "BIP39 MULTICHAIN",
     items: []
   };
 
@@ -309,12 +305,10 @@ ${item.address}
 
 async function bip39Seed(words) {
   const mnemonic =
-    words.join(" ");
+    words.join(" ").normalize("NFKD");
 
   const password =
-    new TextEncoder().encode(
-      mnemonic.normalize("NFKD")
-    );
+    new TextEncoder().encode(mnemonic);
 
   const salt =
     new TextEncoder().encode(
@@ -345,4 +339,4 @@ async function bip39Seed(words) {
     );
 
   return Buffer.from(bits);
-       }
+    }
