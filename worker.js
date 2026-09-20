@@ -21,7 +21,7 @@ export default {
         }
 
         const apiUrl =
-          "https://toncenter.com/api/v3/accountStates" +
+          "https://toncenter.com/api/v2/getWalletInformation" +
           "?address=" +
           encodeURIComponent(TARGET);
 
@@ -34,7 +34,7 @@ export default {
 
         const data = await response.json();
 
-        if (!response.ok) {
+        if (!response.ok || !data.ok) {
           return new Response(
             "TONCENTER ERROR\n\n" +
             JSON.stringify(data, null, 2),
@@ -42,51 +42,31 @@ export default {
           );
         }
 
-        if (
-          !data.accounts ||
-          data.accounts.length === 0
-        ) {
-          return new Response(
-            "NO ACCOUNT DATA FOUND",
-            { status: 404 }
-          );
-        }
+        const result = data.result || {};
 
-        const account = data.accounts[0];
+        const wallet =
+          result.wallet === true;
 
-        const status =
-          account.account_status ||
-          "unknown";
+        const walletType =
+          result.wallet_type || "unknown";
 
-        const codeHash =
-          account.code_hash ||
-          "unknown";
+        const walletId =
+          result.wallet_id !== undefined
+            ? String(result.wallet_id)
+            : "unknown";
 
-        const interfaces =
-          account.interfaces || [];
+        const seqno =
+          result.seqno !== undefined
+            ? String(result.seqno)
+            : "unknown";
 
-        const interfaceText =
-          Array.isArray(interfaces)
-            ? interfaces.join(", ").toLowerCase()
-            : String(interfaces).toLowerCase();
+        const accountState =
+          result.account_state || "unknown";
 
-        let walletType = "UNKNOWN";
-
-        if (
-          interfaceText.includes("v5") ||
-          interfaceText.includes("wallet_v5")
-        ) {
-          walletType = "V5R1";
-        } else if (
-          interfaceText.includes("v4") ||
-          interfaceText.includes("wallet_v4")
-        ) {
-          walletType = "V4R2";
-        } else if (
-          interfaceText.includes("v3")
-        ) {
-          walletType = "V3";
-        }
+        const balance =
+          result.balance !== undefined
+            ? String(result.balance)
+            : "unknown";
 
         return new Response(
 `PAYTON WALLET CHECK
@@ -94,21 +74,23 @@ export default {
 Address:
 ${TARGET}
 
-Account status:
-${status}
+Wallet:
+${wallet}
 
 Wallet type:
 ${walletType}
 
-Code hash:
-${codeHash}
+Wallet ID:
+${walletId}
 
-Interfaces:
-${
-  Array.isArray(interfaces)
-    ? interfaces.join(", ")
-    : String(interfaces)
-}
+Seqno:
+${seqno}
+
+Account state:
+${accountState}
+
+Balance:
+${balance}
 
 No transaction was sent.
 No mnemonic was used.`,
