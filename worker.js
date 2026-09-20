@@ -1,342 +1,2308 @@
 import { Buffer } from "buffer";
 
-globalThis.Buffer = Buffer;
-globalThis.window = globalThis;
+import {
+  Address,
+  beginCell,
+  internal,
+  SendMode,
+  toNano,
+  Cell
+} from "@ton/core";
 
 import {
-  WalletContractV4,
+  TonClient,
   WalletContractV5R1,
-  WalletContractV3R2
+  JettonMaster,
+  JettonWallet
 } from "@ton/ton";
 
-import {
-  mnemonicToPrivateKey,
-  deriveEd25519Path,
-  keyPairFromSeed
-} from "@ton/crypto";
+import { mnemonicToPrivateKey } from "@ton/crypto";
 
-const TARGET =
-  "UQD9eW663lS-7SeGVyYK_cQlKBSjzWSbxaBkgUTigTjZ9Hh6";
+globalThis.Buffer = Buffer;
 
-const CHECK_PATH =
-  "/__wallet_derivation_check_739182";
 
-export default {
-  async fetch(request, env) {
-    const url = new URL(request.url);
+/* =========================================================
+   PAYTON CONFIG
+========================================================= */
 
-    if (
-      request.method === "GET" &&
-      url.pathname === CHECK_PATH
-    ) {
-      return runWalletCheck(env);
-    }
+const WELCOME = `🦊 Welcome to PAYTON (PTN)
 
-    return new Response(
-      "PAYTON wallet derivation check is running!"
-    );
-  }
+Welcome to the official PAYTON presale.
+
+💰 Payment: GRAM
+
+Presale Price:
+1,000,000 PTN = 1 GRAM
+
+Choose an option below:`;
+
+
+const MENU = {
+  inline_keyboard: [
+    [{ text: "🪙 Buy PTN", callback_data: "buy" }],
+    [{ text: "💰 Price", callback_data: "price" }],
+    [{ text: "📋 My Orders", callback_data: "orders" }],
+    [{ text: "💬 Support", callback_data: "support" }]
+  ]
 };
 
-async function runWalletCheck(env) {
-  try {
-    if (!env.PTN_MNEMONIC) {
+
+const BACK = {
+  inline_keyboard: [
+    [{ text: "⬅️ Back", callback_data: "home" }]
+  ]
+};
+
+
+/* =========================================================
+   TOKEN / WALLET CONFIG
+========================================================= */
+
+/*
+  PTN Jetton Master
+*/
+const PTN_MASTER =
+  "EQAZ_Rw9M91opByfYz1edG0TbeAKP72WcdccprkZvbvPVkAZ";
+
+
+/*
+  PTN sender wallet.
+
+  IMPORTANT:
+  PTN_MNEMONIC MUST derive this exact V5R1 address.
+*/
+const PTN_SENDER_WALLET =
+  "UQD9eW663lS-7SeGVyYK_cQlKBSjzWSbxaBkgUTigTjZ9Hh6";
+
+
+/*
+  GRAM receiving wallet
+*/
+const GRAM_RECEIVING_WALLET =
+  "UQB9E73FFG6ql1XwXjt5XXBXi0Xss6zWh1xaJcow1HWaE4IT";
+
+
+/*
+  PTN decimals
+*/
+const PTN_DECIMALS = 9;
+
+
+/*
+  1 GRAM = 1,000,000 PTN
+*/
+const PTN_PER_GRAM = 1000000n;
+
+
+/*
+  Payment verification lookback.
+*/
+const PAYMENT_LOOKBACK_SECONDS =
+  24 * 60 * 60;
+
+
+/*
+  TON attached to Jetton transfer.
+*/
+const JETTON_TRANSFER_GRAM = "0.10";
+
+
+/*
+  Minimum native TON balance we require
+  before attempting an automatic payout.
+
+  This is only a safety guard.
+*/
+const MIN_SENDER_TON_BALANCE =
+  toNano("0.20");
+
+
+/* =========================================================
+   MAIN WORKER
+========================================================= */
+
+export default {
+
+  async fetch(request, env) {
+
+    if (request.method !== "POST") {
       return new Response(
-        "ERROR: PTN_MNEMONIC secret is missing",
-        { status: 500 }
+        "PAYTON Bot is running!"
       );
     }
 
-    const words = env.PTN_MNEMONIC
-      .trim()
-      .split(/\s+/);
+    try {
 
-    const tonResult =
-      await testTONMnemonic(words);
+      const update =
+        await request.json();
 
-    const bip39Result =
-      await testBIP39Mnemonic(words);
 
-    let output =
-`PAYTON WALLET DERIVATION CHECK
+      /* =====================================================
+         TELEGRAM MESSAGES
+      ===================================================== */
 
-Target:
-${TARGET}
+      if (update.message) {
 
-Word count:
-${words.length}
+        const chatId =
+          update.message.chat.id;
 
---------------------------------
-TON MNEMONIC
---------------------------------
+        const username =
+          update.message.from?.username || null;
+
+        const text =
+          (update.message.text || "").trim();
+
+
+        /* ===================================================
+           /start
+        =================================================== */
+
+        if (text === "/start") {
+
+          await env.DB.prepare(
+            `INSERT OR IGNORE INTO users
+             (telegram_id, username)
+             VALUES (?, ?)`
+          )
+            .bind(
+              String(chatId),
+              username
+            )
+            .run();
+
+
+          await env.DB.prepare(
+            `UPDATE users
+             SET username = ?
+             WHERE telegram_id = ?`
+          )
+            .bind(
+              username,
+              String(chatId)
+            )
+            .run();
+
+
+          await env.DB.prepare(
+            `DELETE FROM orders
+             WHERE telegram_id = ?
+             AND status IN (
+               'awaiting_amount',
+               'awaiting_wallet'
+             )`
+          )
+            .bind(
+              String(chatId)
+            )
+            .run();
+
+
+          await telegram(
+            env,
+            "sendMessage",
+            {
+              chat_id: chatId,
+              text: WELCOME,
+              reply_markup: MENU
+            }
+          );
+
+
+          return new Response("OK");
+        }
+
+
+        /* ===================================================
+           CURRENT ORDER STATE
+        =================================================== */
+
+        const pending =
+          await env.DB.prepare(
+            `SELECT *
+             FROM orders
+             WHERE telegram_id = ?
+             AND status IN (
+               'awaiting_amount',
+               'awaiting_wallet'
+             )
+             ORDER BY id DESC
+             LIMIT 1`
+          )
+            .bind(
+              String(chatId)
+            )
+            .first();
+
+
+        if (pending) {
+
+
+          /* ===============================================
+             GRAM AMOUNT
+          =============================================== */
+
+          if (
+            pending.status ===
+            "awaiting_amount"
+          ) {
+
+            const gram =
+              text.replace(",", ".");
+
+
+            if (
+              !/^\d+(\.\d{1,9})?$/.test(
+                gram
+              )
+            ) {
+
+              await telegram(
+                env,
+                "sendMessage",
+                {
+                  chat_id: chatId,
+                  text:
+`❌ Invalid amount.
+
+Please enter the GRAM amount using numbers only.
+
+Example:
+1.5`
+                }
+              );
+
+              return new Response("OK");
+            }
+
+
+            if (
+              Number(gram) <= 0
+            ) {
+
+              await telegram(
+                env,
+                "sendMessage",
+                {
+                  chat_id: chatId,
+                  text:
+                    "❌ The GRAM amount must be greater than 0."
+                }
+              );
+
+              return new Response("OK");
+            }
+
+
+            const ptn =
+              gramToPTN(gram);
+
+
+            await env.DB.prepare(
+              `UPDATE orders
+               SET gram_amount = ?,
+                   ptn_amount = ?,
+                   status = 'awaiting_wallet'
+               WHERE id = ?`
+            )
+              .bind(
+                gram,
+                ptn,
+                pending.id
+              )
+              .run();
+
+
+            await telegram(
+              env,
+              "sendMessage",
+              {
+                chat_id: chatId,
+                text:
+`✅ Order #${pending.id}
+
+💰 Payment: ${gram} GRAM
+🪙 You will receive: ${formatNumber(ptn)} PTN
+
+Now send your TON wallet address.
+
+⚠️ You must pay from this same wallet address.`
+              }
+            );
+
+
+            return new Response("OK");
+          }
+
+
+          /* ===============================================
+             BUYER WALLET ADDRESS
+          =============================================== */
+
+          if (
+            pending.status ===
+            "awaiting_wallet"
+          ) {
+
+            let walletAddress;
+
+
+            try {
+
+              walletAddress =
+                Address.parse(text);
+
+            } catch {
+
+              await telegram(
+                env,
+                "sendMessage",
+                {
+                  chat_id: chatId,
+                  text:
+`❌ Invalid wallet address.
+
+Please send a valid TON wallet address.
+
+Example:
+UQ...`
+                }
+              );
+
+              return new Response("OK");
+            }
+
+
+            const normalizedWallet =
+              walletAddress.toString({
+                urlSafe: true,
+                bounceable: false,
+                testOnly: false
+              });
+
+
+            await env.DB.prepare(
+              `UPDATE orders
+               SET payment_address = ?,
+                   status = 'pending'
+               WHERE id = ?`
+            )
+              .bind(
+                normalizedWallet,
+                pending.id
+              )
+              .run();
+
+
+            const paymentComment =
+              `PAYTON-${pending.id}`;
+
+
+            await telegram(
+              env,
+              "sendMessage",
+              {
+                chat_id: chatId,
+                text:
+`🧾 Order #${pending.id}
+
+💰 Amount: ${pending.gram_amount} GRAM
+🪙 PTN: ${formatNumber(pending.ptn_amount)}
+
+💳 Send exactly:
+${pending.gram_amount} GRAM
+
+📥 Payment address:
+${GRAM_RECEIVING_WALLET}
+
+📝 Payment comment:
+${paymentComment}
+
+⚠️ Important:
+Send the payment from the wallet address you just provided.
+
+After the payment is confirmed on the TON blockchain, your PTN will be sent automatically.`,
+                reply_markup: BACK
+              }
+            );
+
+
+            return new Response("OK");
+          }
+        }
+
+
+        /* ===================================================
+           NORMAL TEXT
+        =================================================== */
+
+        await telegram(
+          env,
+          "sendMessage",
+          {
+            chat_id: chatId,
+            text:
+              "Please choose an option from the menu.",
+            reply_markup: MENU
+          }
+        );
+
+
+        return new Response("OK");
+      }
+
+
+      /* =====================================================
+         CALLBACK BUTTONS
+      ===================================================== */
+
+      if (update.callback_query) {
+
+        const query =
+          update.callback_query;
+
+        const chatId =
+          query.message.chat.id;
+
+        const messageId =
+          query.message.message_id;
+
+        const action =
+          query.data;
+
+
+        await telegram(
+          env,
+          "answerCallbackQuery",
+          {
+            callback_query_id:
+              query.id
+          }
+        );
+
+
+        /* ===================================================
+           HOME
+        =================================================== */
+
+        if (action === "home") {
+
+          await env.DB.prepare(
+            `DELETE FROM orders
+             WHERE telegram_id = ?
+             AND status IN (
+               'awaiting_amount',
+               'awaiting_wallet'
+             )`
+          )
+            .bind(
+              String(chatId)
+            )
+            .run();
+
+
+          await telegram(
+            env,
+            "editMessageText",
+            {
+              chat_id: chatId,
+              message_id: messageId,
+              text: WELCOME,
+              reply_markup: MENU
+            }
+          );
+
+
+          return new Response("OK");
+        }
+
+
+        /* ===================================================
+           BUY
+        =================================================== */
+
+        if (action === "buy") {
+
+          await env.DB.prepare(
+            `DELETE FROM orders
+             WHERE telegram_id = ?
+             AND status IN (
+               'awaiting_amount',
+               'awaiting_wallet'
+             )`
+          )
+            .bind(
+              String(chatId)
+            )
+            .run();
+
+
+          await env.DB.prepare(
+            `INSERT INTO orders
+             (telegram_id, gram_amount, ptn_amount, status)
+             VALUES (?, '0', '0', 'awaiting_amount')`
+          )
+            .bind(
+              String(chatId)
+            )
+            .run();
+
+
+          await telegram(
+            env,
+            "editMessageText",
+            {
+              chat_id: chatId,
+              message_id: messageId,
+              text:
+`🪙 Buy PAYTON (PTN)
+
+Enter the amount of GRAM you want to spend.
+
+Example:
+1.5
+
+You will receive:
+1,500,000 PTN`,
+              reply_markup: BACK
+            }
+          );
+
+
+          return new Response("OK");
+        }
+
+
+        /* ===================================================
+           PRICE
+        =================================================== */
+
+        if (action === "price") {
+
+          await telegram(
+            env,
+            "editMessageText",
+            {
+              chat_id: chatId,
+              message_id: messageId,
+              text:
+`💰 PAYTON Presale Price
+
+1,000,000 PTN = 1 GRAM`,
+              reply_markup: BACK
+            }
+          );
+
+
+          return new Response("OK");
+        }
+
+
+        /* ===================================================
+           ORDERS
+        =================================================== */
+
+        if (action === "orders") {
+
+          const result =
+            await env.DB.prepare(
+              `SELECT
+                 id,
+                 gram_amount,
+                 ptn_amount,
+                 status,
+                 created_at
+               FROM orders
+               WHERE telegram_id = ?
+               AND status NOT IN (
+                 'awaiting_amount',
+                 'awaiting_wallet'
+               )
+               ORDER BY id DESC
+               LIMIT 10`
+            )
+              .bind(
+                String(chatId)
+              )
+              .all();
+
+
+          if (
+            !result.results ||
+            result.results.length === 0
+          ) {
+
+            await telegram(
+              env,
+              "editMessageText",
+              {
+                chat_id: chatId,
+                message_id: messageId,
+                text:
+`📋 My Orders
+
+You have no orders yet.`,
+                reply_markup: BACK
+              }
+            );
+
+
+            return new Response("OK");
+          }
+
+
+          let ordersText =
+            "📋 My Orders\n\n";
+
+
+          for (
+            const order
+            of result.results
+          ) {
+
+            ordersText +=
+`🧾 Order #${order.id}
+
+💰 ${order.gram_amount} GRAM
+🪙 ${formatNumber(order.ptn_amount)} PTN
+📌 Status: ${displayStatus(order.status)}
 
 `;
+          }
 
-    output += formatResults(tonResult);
 
-    output +=
-`
+          await telegram(
+            env,
+            "editMessageText",
+            {
+              chat_id: chatId,
+              message_id: messageId,
+              text: ordersText,
+              reply_markup: BACK
+            }
+          );
 
---------------------------------
-BIP39 MULTICHAIN
---------------------------------
 
-`;
+          return new Response("OK");
+        }
 
-    output += formatResults(bip39Result);
 
-    const matches = [];
+        /* ===================================================
+           SUPPORT
+        =================================================== */
 
-    for (const item of tonResult.items || []) {
-      if (item.match) {
-        matches.push(
-          "TON MNEMONIC -> " + item.wallet
+        if (action === "support") {
+
+          await telegram(
+            env,
+            "editMessageText",
+            {
+              chat_id: chatId,
+              message_id: messageId,
+              text:
+`💬 Support
+
+Please send your message in this chat.
+
+Our Support team will receive your message and respond as soon as possible.`,
+              reply_markup: BACK
+            }
+          );
+
+
+          return new Response("OK");
+        }
+      }
+
+
+      return new Response("OK");
+
+    } catch (error) {
+
+      console.error(
+        "Telegram update error:",
+        error
+      );
+
+      return new Response("OK");
+    }
+  },
+
+
+  /* =========================================================
+     CRON
+  ========================================================= */
+
+  async scheduled(controller, env) {
+
+    try {
+
+      await processOrders(env);
+
+    } catch (error) {
+
+      console.error(
+        "Scheduled payment processor error:",
+        error
+      );
+    }
+  }
+};
+
+
+/* =========================================================
+   PROCESS ORDERS
+========================================================= */
+
+async function processOrders(env) {
+
+  const result =
+    await env.DB.prepare(
+      `SELECT *
+       FROM orders
+       WHERE status IN (
+         'pending',
+         'payment_verified'
+       )
+       ORDER BY id ASC
+       LIMIT 20`
+    )
+      .all();
+
+
+  if (
+    !result.results ||
+    result.results.length === 0
+  ) {
+    return;
+  }
+
+
+  for (
+    const order
+    of result.results
+  ) {
+
+    try {
+
+      /* ===============================================
+         PAYMENT WAITING
+      =============================================== */
+
+      if (
+        order.status ===
+        "pending"
+      ) {
+
+        if (
+          !order.payment_address ||
+          !order.gram_amount ||
+          order.gram_amount === "0"
+        ) {
+          continue;
+        }
+
+
+        const payment =
+          await findPayment(
+            env,
+            order
+          );
+
+
+        if (!payment) {
+          continue;
+        }
+
+
+        /*
+          Extra duplicate protection.
+
+          The unique index is also present in D1,
+          but this check makes the intention explicit.
+        */
+
+        const alreadyUsed =
+          await env.DB.prepare(
+            `SELECT id
+             FROM orders
+             WHERE transaction_hash = ?
+             AND id != ?
+             LIMIT 1`
+          )
+            .bind(
+              payment.transactionHash,
+              order.id
+            )
+            .first();
+
+
+        if (alreadyUsed) {
+
+          console.error(
+            "Payment transaction already used:",
+            payment.transactionHash,
+            "existing order:",
+            alreadyUsed.id,
+            "current order:",
+            order.id
+          );
+
+          continue;
+        }
+
+
+        /*
+          Atomically claim the payment.
+
+          The database unique index on
+          transaction_hash is the final protection
+          against reusing the same transaction.
+        */
+
+        const claimed =
+          await env.DB.prepare(
+            `UPDATE orders
+             SET transaction_hash = ?,
+                 status = 'payment_verified'
+             WHERE id = ?
+             AND status = 'pending'`
+          )
+            .bind(
+              payment.transactionHash,
+              order.id
+            )
+            .run();
+
+
+        if (
+          !claimed.meta ||
+          claimed.meta.changes !== 1
+        ) {
+          continue;
+        }
+
+
+        await telegram(
+          env,
+          "sendMessage",
+          {
+            chat_id:
+              Number(order.telegram_id),
+
+            text:
+`✅ Payment Confirmed
+
+🧾 Order #${order.id}
+
+💰 ${order.gram_amount} GRAM received.
+
+🪙 Your PTN transfer is now being processed automatically.`
+          }
+        );
+
+
+        order.status =
+          "payment_verified";
+
+        order.transaction_hash =
+          payment.transactionHash;
+      }
+
+
+      /* ===============================================
+         PAYOUT
+      =============================================== */
+
+      if (
+        order.status ===
+        "payment_verified"
+      ) {
+
+        await sendPTN(
+          env,
+          order
         );
       }
+
+    } catch (error) {
+
+      console.error(
+        "Order processing failed:",
+        order.id,
+        error
+      );
     }
+  }
+}
 
-    for (const item of bip39Result.items || []) {
-      if (item.match) {
-        matches.push(
-          "BIP39 MULTICHAIN -> " + item.wallet
-        );
-      }
-    }
 
-    output +=
-`
+/* =========================================================
+   FIND GRAM PAYMENT
+========================================================= */
 
---------------------------------
-FINAL RESULT
---------------------------------
+async function findPayment(
+  env,
+  order
+) {
 
-`;
+  const receiving =
+    Address.parse(
+      GRAM_RECEIVING_WALLET
+    );
 
-    if (matches.length > 0) {
-      output +=
-`MATCH FOUND
 
-${matches.join("\n")}
+  const expectedSource =
+    Address.parse(
+      order.payment_address
+    );
 
-The target address matches a tested derivation method.
-`;
-    } else {
-      output +=
-`NO MATCH FOUND
 
-The tested derivation methods did not produce the target address.
+  const expectedAmount =
+    gramToNano(
+      order.gram_amount
+    );
 
-No transaction was sent.
-No mnemonic was displayed.
-`;
-    }
 
-    return new Response(
-      output,
+  const orderCreated =
+    parseSqliteDate(
+      order.created_at
+    );
+
+
+  const startTime =
+    Math.max(
+      orderCreated - 60,
+      Math.floor(
+        Date.now() / 1000
+      ) -
+        PAYMENT_LOOKBACK_SECONDS
+    );
+
+
+  const endTime =
+    Math.floor(
+      Date.now() / 1000
+    ) + 10;
+
+
+  const url =
+    new URL(
+      "https://toncenter.com/api/v3/transactions"
+    );
+
+
+  url.searchParams.set(
+    "account",
+    receiving.toRawString()
+  );
+
+
+  url.searchParams.set(
+    "start_utime",
+    String(startTime)
+  );
+
+
+  url.searchParams.set(
+    "end_utime",
+    String(endTime)
+  );
+
+
+  url.searchParams.set(
+    "limit",
+    "100"
+  );
+
+
+  url.searchParams.set(
+    "sort",
+    "desc"
+  );
+
+
+  const response =
+    await fetch(
+      url.toString(),
       {
         headers: {
-          "Content-Type":
-            "text/plain; charset=UTF-8"
+          "X-API-Key":
+            env.TONCENTER_API_KEY
         }
       }
     );
 
-  } catch (error) {
-    console.error(error);
 
-    return new Response(
-      "ERROR\n\n" +
-      String(error?.message || error),
-      { status: 500 }
+  if (!response.ok) {
+
+    throw new Error(
+      `TON Center transaction API error: ${response.status}`
     );
   }
-}
 
-async function testTONMnemonic(words) {
-  const group = {
-    items: []
-  };
 
-  try {
-    const keyPair =
-      await mnemonicToPrivateKey(words);
+  const data =
+    await response.json();
 
-    addWalletResult(
-      group,
-      "V5R1",
-      createV5(keyPair.publicKey)
-    );
 
-    addWalletResult(
-      group,
-      "V4R2",
-      createV4(keyPair.publicKey)
-    );
+  const transactions =
+    data.transactions || [];
 
-    addWalletResult(
-      group,
-      "V3R2",
-      createV3(keyPair.publicKey)
-    );
 
-  } catch (error) {
-    group.error =
-      String(error?.message || error);
-  }
+  const expectedComment =
+    `PAYTON-${order.id}`;
 
-  return group;
-}
 
-async function testBIP39Mnemonic(words) {
-  const group = {
-    items: []
-  };
+  for (
+    const tx
+    of transactions
+  ) {
 
-  try {
-    const seed =
-      await bip39Seed(words);
+    /* -----------------------------------------------
+       Transaction must not be aborted
+    ----------------------------------------------- */
 
-    const derivedSeed =
-      await deriveEd25519Path(
-        seed,
-        [44, 607, 0]
+    if (
+      tx.description?.aborted === true
+    ) {
+      continue;
+    }
+
+
+    /* -----------------------------------------------
+       Must contain inbound message
+    ----------------------------------------------- */
+
+    if (!tx.in_msg) {
+      continue;
+    }
+
+
+    const message =
+      tx.in_msg;
+
+
+    if (
+      message.bounced === true
+    ) {
+      continue;
+    }
+
+
+    if (
+      !message.source ||
+      !message.destination
+    ) {
+      continue;
+    }
+
+
+    let source;
+    let destination;
+
+
+    try {
+
+      source =
+        Address.parse(
+          message.source
+        );
+
+      destination =
+        Address.parse(
+          message.destination
+        );
+
+    } catch {
+
+      continue;
+    }
+
+
+    /* -----------------------------------------------
+       Exact sender
+    ----------------------------------------------- */
+
+    if (
+      source.toRawString() !==
+      expectedSource.toRawString()
+    ) {
+      continue;
+    }
+
+
+    /* -----------------------------------------------
+       Exact receiving wallet
+    ----------------------------------------------- */
+
+    if (
+      destination.toRawString() !==
+      receiving.toRawString()
+    ) {
+      continue;
+    }
+
+
+    /* -----------------------------------------------
+       Exact GRAM amount
+    ----------------------------------------------- */
+
+    if (
+      BigInt(
+        message.value || "0"
+      ) !== expectedAmount
+    ) {
+      continue;
+    }
+
+
+    /* -----------------------------------------------
+       Transaction must be after order creation
+    ----------------------------------------------- */
+
+    const txTime =
+      Number(
+        message.created_at ||
+        tx.now ||
+        0
       );
 
+
+    if (
+      txTime < orderCreated
+    ) {
+      continue;
+    }
+
+
+    /* -----------------------------------------------
+       Exact payment comment
+    ----------------------------------------------- */
+
+    const comment =
+      decodeComment(
+        message.message_content?.body
+      );
+
+
+    if (
+      comment !== expectedComment
+    ) {
+      continue;
+    }
+
+
+    /*
+      TON Center v3 transaction object
+      provides the transaction hash here.
+    */
+
+    if (!tx.hash) {
+      continue;
+    }
+
+
+    return {
+      transactionHash:
+        tx.hash
+    };
+  }
+
+
+  return null;
+}
+
+
+/* =========================================================
+   SEND PTN AUTOMATICALLY
+========================================================= */
+
+async function sendPTN(
+  env,
+  order
+) {
+
+  /*
+    First claim the order.
+
+    This prevents concurrent cron executions
+    from processing the same payout.
+  */
+
+  const claim =
+    await env.DB.prepare(
+      `UPDATE orders
+       SET status = 'payout_processing'
+       WHERE id = ?
+       AND status = 'payment_verified'`
+    )
+      .bind(
+        order.id
+      )
+      .run();
+
+
+  if (
+    !claim.meta ||
+    claim.meta.changes !== 1
+  ) {
+
+    return;
+  }
+
+
+  try {
+
+    /* ===============================================
+       TON CLIENT
+    =============================================== */
+
+    const client =
+      new TonClient({
+        endpoint:
+          "https://toncenter.com/api/v2/jsonRPC",
+
+        apiKey:
+          env.TONCENTER_API_KEY
+      });
+
+
+    /* ===============================================
+       SECRET CHECK
+    =============================================== */
+
+    if (
+      !env.PTN_MNEMONIC
+    ) {
+
+      throw new Error(
+        "PTN_MNEMONIC secret is missing."
+      );
+    }
+
+
+    const mnemonic =
+      env.PTN_MNEMONIC
+        .trim()
+        .split(/\s+/);
+
+
+    /* ===============================================
+       DERIVE PRIVATE KEY
+    =============================================== */
+
     const keyPair =
-      keyPairFromSeed(derivedSeed);
+      await mnemonicToPrivateKey(
+        mnemonic
+      );
 
-    addWalletResult(
-      group,
-      "V5R1",
-      createV5(keyPair.publicKey)
+
+    /* ===============================================
+       V5R1 MAINNET WALLET
+    =============================================== */
+
+    const wallet =
+      WalletContractV5R1.create({
+        walletId: {
+          networkGlobalId: -239
+        },
+
+        publicKey:
+          keyPair.publicKey,
+
+        workchain: 0
+      });
+
+
+    /* ===============================================
+       SECURITY CHECK
+    =============================================== */
+
+    const derivedAddress =
+      wallet.address.toRawString();
+
+
+    const expectedSenderAddress =
+      Address
+        .parse(
+          PTN_SENDER_WALLET
+        )
+        .toRawString();
+
+
+    if (
+      derivedAddress !==
+      expectedSenderAddress
+    ) {
+
+      throw new Error(
+        "PTN_MNEMONIC does not match the configured PTN sender wallet."
+      );
+    }
+
+
+    /* ===============================================
+       DESTINATION
+    =============================================== */
+
+    const destination =
+      Address.parse(
+        order.payment_address
+      );
+
+
+    /* ===============================================
+       CHECK SENDER WALLET DEPLOYMENT
+    =============================================== */
+
+    const deployed =
+      await client.isContractDeployed(
+        wallet.address
+      );
+
+
+    if (!deployed) {
+
+      throw new Error(
+        "PTN sender V5R1 wallet is not deployed. The payout wallet must be activated before automatic PTN payouts can be sent."
+      );
+    }
+
+
+    /* ===============================================
+       CHECK NATIVE TON BALANCE
+    =============================================== */
+
+    const tonBalance =
+      await client.getBalance(
+        wallet.address
+      );
+
+
+    if (
+      tonBalance <
+      MIN_SENDER_TON_BALANCE
+    ) {
+
+      throw new Error(
+        "Insufficient TON balance in PTN sender wallet for payout fees."
+      );
+    }
+
+
+    /* ===============================================
+       PTN MASTER
+    =============================================== */
+
+    const master =
+      client.open(
+        JettonMaster.create(
+          Address.parse(
+            PTN_MASTER
+          )
+        )
+      );
+
+
+    /* ===============================================
+       SENDER PTN JETTON WALLET
+    =============================================== */
+
+    const senderJettonWalletAddress =
+      await master.getWalletAddress(
+        wallet.address
+      );
+
+
+    const senderJettonWallet =
+      client.open(
+        JettonWallet.create(
+          senderJettonWalletAddress
+        )
+      );
+
+
+    /* ===============================================
+       PTN BALANCE
+    =============================================== */
+
+    const currentBalance =
+      await senderJettonWallet.getBalance();
+
+
+    const ptnUnits =
+      ptnToUnits(
+        order.ptn_amount
+      );
+
+
+    if (
+      currentBalance <
+      ptnUnits
+    ) {
+
+      throw new Error(
+        "Insufficient PTN balance in sender Jetton wallet."
+      );
+    }
+
+
+    /* ===============================================
+       CHECK FOR EXISTING PAYOUT
+    =============================================== */
+
+    const existingPayout =
+      await findExistingPayout(
+        env,
+        wallet.address,
+        destination,
+        ptnUnits,
+        order.id
+      );
+
+
+    if (
+      existingPayout
+    ) {
+
+      await env.DB.prepare(
+        `UPDATE orders
+         SET status = 'payout_sent'
+         WHERE id = ?
+         AND status = 'payout_processing'`
+      )
+        .bind(
+          order.id
+        )
+        .run();
+
+
+      await telegram(
+        env,
+        "sendMessage",
+        {
+          chat_id:
+            Number(order.telegram_id),
+
+          text:
+`🎉 Order Completed
+
+🧾 Order #${order.id}
+
+🪙 ${formatNumber(order.ptn_amount)} PTN has been sent to your wallet.
+
+Thank you for purchasing PAYTON (PTN).`
+        }
+      );
+
+
+      return;
+    }
+
+
+    /* ===============================================
+       TEP-74 JETTON TRANSFER BODY
+    =============================================== */
+
+    const transferBody =
+      beginCell()
+
+        /*
+          transfer opcode
+        */
+        .storeUint(
+          0x0f8a7ea5,
+          32
+        )
+
+        /*
+          Unique query ID.
+          Order IDs are unique in the database.
+        */
+        .storeUint(
+          BigInt(order.id),
+          64
+        )
+
+        /*
+          PTN amount in base units
+        */
+        .storeCoins(
+          ptnUnits
+        )
+
+        /*
+          Buyer regular wallet
+        */
+        .storeAddress(
+          destination
+        )
+
+        /*
+          Response destination
+        */
+        .storeAddress(
+          wallet.address
+        )
+
+        /*
+          No custom payload
+        */
+        .storeBit(0)
+
+        /*
+          No forward TON
+        */
+        .storeCoins(
+          0n
+        )
+
+        /*
+          Empty forward payload
+        */
+        .storeBit(0)
+
+        .endCell();
+
+
+    /* ===============================================
+       INTERNAL MESSAGE TO SENDER JETTON WALLET
+    =============================================== */
+
+    const transferMessage =
+      internal({
+        to:
+          senderJettonWalletAddress,
+
+        value:
+          toNano(
+            JETTON_TRANSFER_GRAM
+          ),
+
+        bounce: true,
+
+        body:
+          transferBody
+      });
+
+
+    /* ===============================================
+       PROVIDER
+    =============================================== */
+
+    const provider =
+      client.provider(
+        wallet.address
+      );
+
+
+    /* ===============================================
+       SEQNO
+    =============================================== */
+
+    const seqno =
+      await wallet.getSeqno(
+        provider
+      );
+
+
+    /* ===============================================
+       BROADCAST
+    =============================================== */
+
+    await wallet.sendTransfer(
+      provider,
+      {
+        seqno,
+
+        secretKey:
+          keyPair.secretKey,
+
+        messages: [
+          transferMessage
+        ],
+
+        sendMode:
+          SendMode.PAY_GAS_SEPARATELY
+      }
     );
 
-    addWalletResult(
-      group,
-      "V4R2",
-      createV4(keyPair.publicKey)
+
+    /*
+      At this point the signed transaction
+      has been submitted to TON Center.
+    */
+
+
+    await env.DB.prepare(
+      `UPDATE orders
+       SET status = 'payout_sent'
+       WHERE id = ?
+       AND status = 'payout_processing'`
+    )
+      .bind(
+        order.id
+      )
+      .run();
+
+
+    await telegram(
+      env,
+      "sendMessage",
+      {
+        chat_id:
+          Number(order.telegram_id),
+
+        text:
+`🎉 Order Completed
+
+🧾 Order #${order.id}
+
+🪙 ${formatNumber(order.ptn_amount)} PTN has been sent automatically.
+
+Thank you for purchasing PAYTON (PTN).`
+      }
     );
 
-    addWalletResult(
-      group,
-      "V3R2",
-      createV3(keyPair.publicKey)
-    );
 
   } catch (error) {
-    group.error =
-      String(error?.message || error);
+
+    console.error(
+      "PTN payout error:",
+      order.id,
+      error
+    );
+
+
+    /*
+      Retry on the next Cron run.
+
+      Before another broadcast, findExistingPayout()
+      checks the blockchain using the unique order ID
+      as query_id.
+    */
+
+    await env.DB.prepare(
+      `UPDATE orders
+       SET status = 'payment_verified'
+       WHERE id = ?
+       AND status = 'payout_processing'`
+    )
+      .bind(
+        order.id
+      )
+      .run();
+
+
+    await telegram(
+      env,
+      "sendMessage",
+      {
+        chat_id:
+          Number(order.telegram_id),
+
+        text:
+`⚠️ Payment was confirmed for Order #${order.id}, but the PTN transfer is still processing.
+
+The system will retry automatically.`
+      }
+    );
   }
-
-  return group;
 }
 
-function createV5(publicKey) {
-  return WalletContractV5R1.create({
-    walletId: {
-      networkGlobalId: -239
-    },
-    publicKey,
-    workchain: 0
-  });
-}
 
-function createV4(publicKey) {
-  return WalletContractV4.create({
-    workchain: 0,
-    publicKey,
-    walletId: 0x29a9a317
-  });
-}
+/* =========================================================
+   FIND EXISTING PTN PAYOUT
+========================================================= */
 
-function createV3(publicKey) {
-  return WalletContractV3R2.create({
-    workchain: 0,
-    publicKey,
-    walletId: 0
-  });
-}
-
-function addWalletResult(
-  group,
-  wallet,
-  contract
+async function findExistingPayout(
+  env,
+  senderAddress,
+  destination,
+  expectedAmount,
+  orderId
 ) {
-  const address =
-    contract.address.toString({
-      bounceable: false,
-      urlSafe: true
-    });
 
-  group.items.push({
-    wallet,
-    address,
-    match: address === TARGET
-  });
-}
+  const url =
+    new URL(
+      "https://toncenter.com/api/v3/jetton/transfers"
+    );
 
-function formatResults(group) {
-  let text = "";
 
-  if (group.error) {
-    text +=
-`ERROR:
-${group.error}
-`;
+  /*
+    owner_address is the owner of the Jetton wallet.
+    Here that owner is our V5R1 sender wallet.
+  */
 
-    return text;
+  url.searchParams.set(
+    "owner_address",
+    senderAddress.toRawString()
+  );
+
+
+  url.searchParams.set(
+    "jetton_master",
+    Address
+      .parse(
+        PTN_MASTER
+      )
+      .toRawString()
+  );
+
+
+  url.searchParams.set(
+    "direction",
+    "out"
+  );
+
+
+  url.searchParams.set(
+    "start_utime",
+    String(
+      Math.floor(
+        Date.now() / 1000
+      ) -
+        PAYMENT_LOOKBACK_SECONDS
+    )
+  );
+
+
+  url.searchParams.set(
+    "limit",
+    "100"
+  );
+
+
+  url.searchParams.set(
+    "sort",
+    "desc"
+  );
+
+
+  const response =
+    await fetch(
+      url.toString(),
+      {
+        headers: {
+          "X-API-Key":
+            env.TONCENTER_API_KEY
+        }
+      }
+    );
+
+
+  /*
+    If the indexer is temporarily unavailable,
+    return false and allow the normal retry flow.
+  */
+
+  if (!response.ok) {
+
+    console.error(
+      "Jetton transfer lookup failed:",
+      response.status
+    );
+
+    return false;
   }
 
-  for (const item of group.items) {
-    text +=
-`${item.wallet}
-${item.address}
 
-`;
+  const data =
+    await response.json();
 
-    if (item.match) {
-      text +=
-"*** MATCH ***\n\n";
+
+  const transfers =
+    data.jetton_transfers || [];
+
+
+  for (
+    const transfer
+    of transfers
+  ) {
+
+    /* ===============================================
+       Must not be aborted
+    =============================================== */
+
+    if (
+      transfer.transaction_aborted === true
+    ) {
+      continue;
     }
+
+
+    /* ===============================================
+       Exact unique order query ID
+    =============================================== */
+
+    if (
+      String(
+        transfer.query_id
+      ) !==
+      String(orderId)
+    ) {
+      continue;
+    }
+
+
+    /* ===============================================
+       Exact PTN amount
+    =============================================== */
+
+    if (
+      BigInt(
+        transfer.amount || "0"
+      ) !==
+      expectedAmount
+    ) {
+      continue;
+    }
+
+
+    /* ===============================================
+       Exact destination
+    =============================================== */
+
+    if (
+      !transfer.destination
+    ) {
+      continue;
+    }
+
+
+    try {
+
+      const transferDestination =
+        Address.parse(
+          transfer.destination
+        );
+
+
+      if (
+        transferDestination.toRawString() !==
+        destination.toRawString()
+      ) {
+        continue;
+      }
+
+    } catch {
+
+      continue;
+    }
+
+
+    /*
+      All important fields match.
+    */
+
+    return {
+      transactionHash:
+        transfer.transaction_hash || null
+    };
   }
 
-  return text;
+
+  return null;
 }
 
-async function bip39Seed(words) {
-  const mnemonic =
-    words.join(" ").normalize("NFKD");
 
-  const password =
-    new TextEncoder().encode(mnemonic);
+/* =========================================================
+   GRAM → PTN
+========================================================= */
 
-  const salt =
-    new TextEncoder().encode(
-      "mnemonic"
+function gramToPTN(
+  value
+) {
+
+  const parts =
+    String(value)
+      .split(".");
+
+
+  const whole =
+    parts[0] || "0";
+
+
+  const decimal =
+    (parts[1] || "")
+      .padEnd(
+        9,
+        "0"
+      );
+
+
+  const gramUnits =
+    BigInt(whole) *
+      1000000000n +
+    BigInt(decimal);
+
+
+  const ptnUnits =
+    gramUnits *
+    PTN_PER_GRAM;
+
+
+  const ptnWhole =
+    ptnUnits /
+    1000000000n;
+
+
+  const ptnDecimal =
+    ptnUnits %
+    1000000000n;
+
+
+  if (
+    ptnDecimal === 0n
+  ) {
+
+    return ptnWhole.toString();
+  }
+
+
+  return (
+    ptnWhole.toString() +
+    "." +
+    ptnDecimal
+      .toString()
+      .padStart(
+        9,
+        "0"
+      )
+      .replace(
+        /0+$/,
+        ""
+      )
+  );
+}
+
+
+/* =========================================================
+   GRAM → NANO GRAM
+========================================================= */
+
+function gramToNano(
+  value
+) {
+
+  const parts =
+    String(value)
+      .split(".");
+
+
+  const whole =
+    parts[0] || "0";
+
+
+  const decimal =
+    (parts[1] || "")
+      .padEnd(
+        9,
+        "0"
+      );
+
+
+  return (
+    BigInt(whole) *
+      1000000000n +
+    BigInt(decimal)
+  );
+}
+
+
+/* =========================================================
+   PTN HUMAN AMOUNT → BASE UNITS
+========================================================= */
+
+function ptnToUnits(
+  value
+) {
+
+  const parts =
+    String(value)
+      .split(".");
+
+
+  const whole =
+    parts[0] || "0";
+
+
+  const decimal =
+    (parts[1] || "")
+      .padEnd(
+        PTN_DECIMALS,
+        "0"
+      );
+
+
+  if (
+    decimal.length >
+    PTN_DECIMALS
+  ) {
+
+    throw new Error(
+      "Invalid PTN decimals."
+    );
+  }
+
+
+  return (
+    BigInt(whole) *
+      1000000000n +
+    BigInt(decimal)
+  );
+}
+
+
+/* =========================================================
+   FORMAT NUMBER
+========================================================= */
+
+function formatNumber(
+  value
+) {
+
+  const parts =
+    String(value)
+      .split(".");
+
+
+  parts[0] =
+    Number(
+      parts[0]
+    ).toLocaleString(
+      "en-US"
     );
 
-  const key =
-    await crypto.subtle.importKey(
-      "raw",
-      password,
-      {
-        name: "PBKDF2"
-      },
-      false,
-      ["deriveBits"]
+
+  return parts.join(".");
+}
+
+
+/* =========================================================
+   STATUS DISPLAY
+========================================================= */
+
+function displayStatus(
+  status
+) {
+
+  switch (status) {
+
+    case "pending":
+      return "Waiting for payment";
+
+    case "payment_verified":
+      return "Payment verified";
+
+    case "payout_processing":
+      return "Sending PTN";
+
+    case "payout_sent":
+      return "Completed";
+
+    default:
+      return status;
+  }
+}
+
+
+/* =========================================================
+   PARSE SQLITE UTC DATE
+========================================================= */
+
+function parseSqliteDate(
+  value
+) {
+
+  if (!value) {
+
+    return Math.floor(
+      Date.now() / 1000
+    );
+  }
+
+
+  const parsed =
+    Date.parse(
+      String(value)
+        .replace(
+          " ",
+          "T"
+        ) +
+        "Z"
     );
 
-  const bits =
-    await crypto.subtle.deriveBits(
-      {
-        name: "PBKDF2",
-        hash: "SHA-512",
-        salt,
-        iterations: 2048
-      },
-      key,
-      512
-    );
 
-  return Buffer.from(bits);
+  if (
+    Number.isNaN(parsed)
+  ) {
+
+    return Math.floor(
+      Date.now() / 1000
+    );
+  }
+
+
+  return Math.floor(
+    parsed / 1000
+  );
+}
+
+
+/* =========================================================
+   DECODE TON COMMENT
+========================================================= */
+
+function decodeComment(
+  body
+) {
+
+  if (!body) {
+    return null;
+  }
+
+
+  try {
+
+    const cells =
+      Cell.fromBoc(
+        Buffer.from(
+          body,
+          "base64"
+        )
+      );
+
+
+    if (
+      !cells ||
+      cells.length === 0
+    ) {
+      return null;
     }
+
+
+    let cell =
+      cells[0];
+
+
+    const chunks =
+      [];
+
+
+    while (cell) {
+
+      const slice =
+        cell.beginParse();
+
+
+      if (
+        slice.remainingBits < 32
+      ) {
+        return null;
+      }
+
+
+      const opcode =
+        slice.loadUint(32);
+
+
+      /*
+        0x00000000 =
+        standard text comment
+      */
+
+      if (
+        opcode !== 0
+      ) {
+        return null;
+      }
+
+
+      if (
+        slice.remainingBits > 0
+      ) {
+
+        const byteCount =
+          Math.floor(
+            slice.remainingBits / 8
+          );
+
+
+        if (
+          byteCount > 0
+        ) {
+
+          chunks.push(
+            slice.loadBuffer(
+              byteCount
+            )
+          );
+        }
+      }
+
+
+      if (
+        slice.remainingRefs === 0
+      ) {
+        break;
+      }
+
+
+      cell =
+        slice.loadRef();
+    }
+
+
+    return Buffer
+      .concat(chunks)
+      .toString(
+        "utf8"
+      );
+
+  } catch (error) {
+
+    console.error(
+      "Comment decode error:",
+      error
+    );
+
+    return null;
+  }
+}
+
+
+/* =========================================================
+   TELEGRAM API
+========================================================= */
+
+async function telegram(
+  env,
+  method,
+  data
+) {
+
+  const response =
+    await fetch(
+      "https://api.telegram.org/bot" +
+      env.BOT_TOKEN +
+      "/" +
+      method,
+      {
+        method: "POST",
+
+        headers: {
+          "Content-Type":
+            "application/json"
+        },
+
+        body:
+          JSON.stringify(
+            data
+          )
+      }
+    );
+
+
+  return response;
+}
