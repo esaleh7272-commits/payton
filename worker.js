@@ -350,4 +350,136 @@ async function runDiagnostic(env) {
       "MNEMONIC_MATCHES_CONFIGURED_WALLET";
   } else if (publicKeyMatch) {
     result.diagnosis =
-      "MNEMONIC_PUBLIC_KEY_MATCHES_ON_CHAIN_WALLET_BUT_WALLET_CON
+      "MNEMONIC_PUBLIC_KEY_MATCHES_ON_CHAIN_WALLET_BUT_WALLET_CONTRACT_OR_WALLET_ID_IS_DIFFERENT";
+  } else if (
+    result.on_chain?.public_key_matches_mnemonic === false
+  ) {
+    result.diagnosis =
+      "MNEMONIC_DERIVES_A_DIFFERENT_PUBLIC_KEY_THAN_THE_CONFIGURED_SENDER";
+  } else {
+    result.diagnosis =
+      "MNEMONIC_DERIVATION_WORKED_BUT_CONFIGURED_WALLET_TYPE_OR_DERIVATION_SCHEME_IS_NOT_YET_IDENTIFIED";
+  }
+
+  result.safety =
+    "DIAGNOSTIC_ONLY. NO TRANSACTION WAS CREATED OR SENT.";
+
+  return result;
+}
+
+async function handleTelegramUpdate(env, update) {
+  const message = update?.message;
+
+  if (!message) {
+    return;
+  }
+
+  const chatId =
+    String(message.chat?.id || "");
+
+  const userId =
+    String(message.from?.id || "");
+
+  if (userId !== ADMIN_TELEGRAM_ID) {
+    return;
+  }
+
+  const text =
+    String(message.text || "").trim();
+
+  if (text === "/start") {
+    await sendMessage(
+      env,
+      chatId,
+      "PAYTON diagnostic bot.\n\nSend /diag to check the PTN sender wallet.\n\nNo transaction will be sent."
+    );
+    return;
+  }
+
+  if (text === "/diag") {
+    await sendMessage(
+      env,
+      chatId,
+      "🔎 Running wallet diagnostic...\n\nNo transaction will be sent."
+    );
+
+    try {
+      const result =
+        await runDiagnostic(env);
+
+      await sendMessage(
+        env,
+        chatId,
+        "🔎 DIAGNOSTIC RESULT\n\n" +
+        JSON.stringify(result, null, 2)
+      );
+    } catch (error) {
+      await sendMessage(
+        env,
+        chatId,
+        "❌ Diagnostic failed.\n\n" +
+        String(error?.message || error)
+      );
+    }
+
+    return;
+  }
+
+  await sendMessage(
+    env,
+    chatId,
+    "Send /diag to run the sender-wallet diagnostic."
+  );
+}
+
+export default {
+  async fetch(request, env) {
+    try {
+      if (request.method === "GET") {
+        const url =
+          new URL(request.url);
+
+        if (url.pathname === "/diag") {
+          if (!env.PTN_MNEMONIC) {
+            return json({
+              ok: false,
+              error: "PTN_MNEMONIC secret is missing."
+            }, 500);
+          }
+
+          const result =
+            await runDiagnostic(env);
+
+          return json(result);
+        }
+
+        return new Response(
+          "PAYTON diagnostic worker is running.",
+          { status: 200 }
+        );
+      }
+
+      if (request.method === "POST") {
+        const update =
+          await request.json();
+
+        await handleTelegramUpdate(
+          env,
+          update
+        );
+
+        return new Response("OK");
+      }
+
+      return new Response(
+        "Method Not Allowed",
+        { status: 405 }
+      );
+    } catch (error) {
+      return json({
+        ok: false,
+        error: String(error?.message || error)
+      }, 500);
+    }
+  }
+};
