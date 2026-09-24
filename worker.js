@@ -40,6 +40,8 @@ const PAYMENT_EXPIRY_SECONDS = 3 * 24 * 60 * 60;
 const PAYMENT_SEARCH_PAGES = 5;
 const PAYOUT_SEARCH_PAGES = 5;
 
+const PAYOUT_PROCESSING_LOCK_SECONDS = 600;
+
 const WELCOME_TEXT =
   "Welcome to PTN Presale.\n\nChoose an option below.";
 
@@ -77,7 +79,9 @@ export default {
       }
 
       if (request.method !== "POST") {
-        return new Response("Method Not Allowed", { status: 405 });
+        return new Response("Method Not Allowed", {
+          status: 405
+        });
       }
 
       const update = await request.json();
@@ -88,14 +92,21 @@ export default {
             await ensureSchema(env);
             await handleUpdate(env, update);
           } catch (error) {
-            console.error("UPDATE ERROR:", error);
+            console.error(
+              "UPDATE ERROR:",
+              describeError(error)
+            );
           }
         })()
       );
 
       return new Response("OK");
     } catch (error) {
-      console.error("FETCH ERROR:", error);
+      console.error(
+        "FETCH ERROR:",
+        describeError(error)
+      );
+
       return new Response("OK");
     }
   },
@@ -107,7 +118,10 @@ export default {
           await ensureSchema(env);
           await processOrders(env);
         } catch (error) {
-          console.error("CRON ERROR:", error);
+          console.error(
+            "CRON ERROR:",
+            describeError(error)
+          );
         }
       })()
     );
@@ -119,10 +133,14 @@ export default {
 /* -------------------------------------------------------------------------- */
 
 async function telegram(env, method, body) {
-  const token = String(env.BOT_TOKEN || "").trim();
+  const token = String(
+    env.BOT_TOKEN || ""
+  ).trim();
 
   if (!token) {
-    throw new Error("BOT_TOKEN missing");
+    throw new Error(
+      "BOT_TOKEN missing"
+    );
   }
 
   const response = await fetch(
@@ -138,10 +156,14 @@ async function telegram(env, method, body) {
 
   if (!response.ok) {
     const text = await response.text();
-    throw new Error(`Telegram API ${method} ${response.status}: ${text}`);
+
+    throw new Error(
+      `Telegram API ${method} ${response.status}: ${text}`
+    );
   }
 
-  const data = await response.json();
+  const data =
+    await response.json();
 
   if (!data.ok) {
     throw new Error(
@@ -152,20 +174,36 @@ async function telegram(env, method, body) {
   return data;
 }
 
-async function sendMessage(env, chatId, text, replyMarkup = null) {
+async function sendMessage(
+  env,
+  chatId,
+  text,
+  replyMarkup = null
+) {
   const body = {
     chat_id: chatId,
     text
   };
 
   if (replyMarkup) {
-    body.reply_markup = replyMarkup;
+    body.reply_markup =
+      replyMarkup;
   }
 
-  return telegram(env, "sendMessage", body);
+  return telegram(
+    env,
+    "sendMessage",
+    body
+  );
 }
 
-async function editMessage(env, chatId, messageId, text, replyMarkup = null) {
+async function editMessage(
+  env,
+  chatId,
+  messageId,
+  text,
+  replyMarkup = null
+) {
   const body = {
     chat_id: chatId,
     message_id: messageId,
@@ -173,19 +211,34 @@ async function editMessage(env, chatId, messageId, text, replyMarkup = null) {
   };
 
   if (replyMarkup) {
-    body.reply_markup = replyMarkup;
+    body.reply_markup =
+      replyMarkup;
   }
 
-  return telegram(env, "editMessageText", body);
+  return telegram(
+    env,
+    "editMessageText",
+    body
+  );
 }
 
-async function answerCallback(env, callbackId) {
+async function answerCallback(
+  env,
+  callbackId
+) {
   try {
-    await telegram(env, "answerCallbackQuery", {
-      callback_query_id: callbackId
-    });
+    await telegram(
+      env,
+      "answerCallbackQuery",
+      {
+        callback_query_id: callbackId
+      }
+    );
   } catch (error) {
-    console.error("CALLBACK ANSWER ERROR:", error);
+    console.error(
+      "CALLBACK ANSWER ERROR:",
+      describeError(error)
+    );
   }
 }
 
@@ -193,21 +246,38 @@ async function answerCallback(env, callbackId) {
 /* Keyboards                                                                  */
 /* -------------------------------------------------------------------------- */
 
-function mainMenuKeyboard(isAdmin = false) {
+function mainMenuKeyboard(
+  isAdmin = false
+) {
   const rows = [
     [
-      { text: "Buy PTN", callback_data: "buy" },
-      { text: "PTN Price", callback_data: "price" }
+      {
+        text: "Buy PTN",
+        callback_data: "buy"
+      },
+      {
+        text: "PTN Price",
+        callback_data: "price"
+      }
     ],
     [
-      { text: "My Orders", callback_data: "orders" },
-      { text: "Support", callback_data: "support" }
+      {
+        text: "My Orders",
+        callback_data: "orders"
+      },
+      {
+        text: "Support",
+        callback_data: "support"
+      }
     ]
   ];
 
   if (isAdmin) {
     rows.push([
-      { text: "Admin Panel", callback_data: "admin" }
+      {
+        text: "Admin Panel",
+        callback_data: "admin"
+      }
     ]);
   }
 
@@ -219,12 +289,19 @@ function mainMenuKeyboard(isAdmin = false) {
 function backKeyboard() {
   return {
     inline_keyboard: [
-      [{ text: "Back", callback_data: "menu" }]
+      [
+        {
+          text: "Back",
+          callback_data: "menu"
+        }
+      ]
     ]
   };
 }
 
-function paymentKeyboard(orderId) {
+function paymentKeyboard(
+  orderId
+) {
   return {
     inline_keyboard: [
       [
@@ -253,23 +330,50 @@ function adminMenuKeyboard() {
   return {
     inline_keyboard: [
       [
-        { text: "Dashboard", callback_data: "admin_dashboard" },
-        { text: "All Orders", callback_data: "admin_orders" }
+        {
+          text: "Dashboard",
+          callback_data: "admin_dashboard"
+        },
+        {
+          text: "All Orders",
+          callback_data: "admin_orders"
+        }
       ],
       [
-        { text: "Pending", callback_data: "admin_pending" },
-        { text: "Users", callback_data: "admin_users" }
+        {
+          text: "Pending",
+          callback_data: "admin_pending"
+        },
+        {
+          text: "Users",
+          callback_data: "admin_users"
+        }
       ],
       [
-        { text: "Support", callback_data: "admin_support" },
-        { text: "Suspicious", callback_data: "admin_suspicious" }
+        {
+          text: "Support",
+          callback_data: "admin_support"
+        },
+        {
+          text: "Suspicious",
+          callback_data: "admin_suspicious"
+        }
       ],
       [
-        { text: "Revenue", callback_data: "admin_revenue" },
-        { text: "Reply Templates", callback_data: "admin_templates" }
+        {
+          text: "Revenue",
+          callback_data: "admin_revenue"
+        },
+        {
+          text: "Reply Templates",
+          callback_data: "admin_templates"
+        }
       ],
       [
-        { text: "Back", callback_data: "menu" }
+        {
+          text: "Back",
+          callback_data: "menu"
+        }
       ]
     ]
   };
@@ -279,64 +383,82 @@ function adminBackKeyboard() {
   return {
     inline_keyboard: [
       [
-        { text: "Admin Panel", callback_data: "admin" }
+        {
+          text: "Admin Panel",
+          callback_data: "admin"
+        }
       ]
     ]
   };
 }
 
-function ticketKeyboard(ticketId) {
+function ticketKeyboard(
+  ticketId
+) {
   return {
     inline_keyboard: [
       [
         {
           text: "Reply",
-          callback_data: `ticket_reply:${ticketId}`
+          callback_data:
+            `ticket_reply:${ticketId}`
         }
       ],
       [
         {
           text: "Quick Reply 1",
-          callback_data: `qr:1:${ticketId}`
+          callback_data:
+            `qr:1:${ticketId}`
         },
         {
           text: "Quick Reply 2",
-          callback_data: `qr:2:${ticketId}`
+          callback_data:
+            `qr:2:${ticketId}`
         }
       ],
       [
         {
           text: "Quick Reply 3",
-          callback_data: `qr:3:${ticketId}`
+          callback_data:
+            `qr:3:${ticketId}`
         },
         {
           text: "Quick Reply 4",
-          callback_data: `qr:4:${ticketId}`
+          callback_data:
+            `qr:4:${ticketId}`
         }
       ],
       [
         {
           text: "Close Ticket",
-          callback_data: `ticket_close:${ticketId}`
+          callback_data:
+            `ticket_close:${ticketId}`
         }
       ],
       [
         {
           text: "Support List",
-          callback_data: "admin_support"
+          callback_data:
+            "admin_support"
         }
       ]
     ]
   };
 }
 
-function userAdminKeyboard(telegramId, blocked) {
+function userAdminKeyboard(
+  telegramId,
+  blocked
+) {
   return {
     inline_keyboard: [
       [
         {
-          text: blocked ? "Unblock User" : "Block User",
-          callback_data: `${blocked ? "unblock" : "block"}:${telegramId}`
+          text: blocked
+            ? "Unblock User"
+            : "Block User",
+          callback_data:
+            `${blocked ? "unblock" : "block"}:${telegramId}`
         }
       ],
       [
@@ -353,34 +475,61 @@ function userAdminKeyboard(telegramId, blocked) {
 /* Update handling                                                            */
 /* -------------------------------------------------------------------------- */
 
-async function handleUpdate(env, update) {
+async function handleUpdate(
+  env,
+  update
+) {
   if (update.callback_query) {
-    const callback = update.callback_query;
+    const callback =
+      update.callback_query;
 
-    const telegramId = String(
-      callback.from?.id ?? ""
-    );
+    const telegramId =
+      String(
+        callback.from?.id ?? ""
+      );
 
     if (!telegramId) {
       return;
     }
 
-    await upsertUser(env, callback.from);
+    await upsertUser(
+      env,
+      callback.from
+    );
 
-    const blocked = await isUserBlocked(env, telegramId);
+    const blocked =
+      await isUserBlocked(
+        env,
+        telegramId
+      );
 
-    if (blocked && !isAdmin(telegramId)) {
-      await answerCallback(env, callback.id);
+    if (
+      blocked &&
+      !isAdmin(telegramId)
+    ) {
+      await answerCallback(
+        env,
+        callback.id
+      );
+
       await sendMessage(
         env,
         telegramId,
         "Your account is currently blocked."
       );
+
       return;
     }
 
-    await answerCallback(env, callback.id);
-    await handleCallback(env, callback);
+    await answerCallback(
+      env,
+      callback.id
+    );
+
+    await handleCallback(
+      env,
+      callback
+    );
 
     return;
   }
@@ -389,63 +538,97 @@ async function handleUpdate(env, update) {
     return;
   }
 
-  const message = update.message;
-  const from = message.from;
+  const message =
+    update.message;
+
+  const from =
+    message.from;
 
   if (!from?.id) {
     return;
   }
 
-  const telegramId = String(from.id);
+  const telegramId =
+    String(from.id);
 
-  await upsertUser(env, from);
+  await upsertUser(
+    env,
+    from
+  );
 
-  const blocked = await isUserBlocked(env, telegramId);
+  const blocked =
+    await isUserBlocked(
+      env,
+      telegramId
+    );
 
-  if (blocked && !isAdmin(telegramId)) {
+  if (
+    blocked &&
+    !isAdmin(telegramId)
+  ) {
     await sendMessage(
       env,
       telegramId,
       "Your account is currently blocked."
     );
+
     return;
   }
 
-  const text = String(message.text || "").trim();
+  const text =
+    String(
+      message.text || ""
+    ).trim();
 
   if (!text) {
     return;
   }
 
   if (text === "/start") {
-    await clearUserState(env, telegramId);
+    await clearUserState(
+      env,
+      telegramId
+    );
 
     await sendMessage(
       env,
       telegramId,
       WELCOME_TEXT,
-      mainMenuKeyboard(isAdmin(telegramId))
+      mainMenuKeyboard(
+        isAdmin(telegramId)
+      )
     );
 
     return;
   }
 
   if (text === "/menu") {
-    await clearUserState(env, telegramId);
+    await clearUserState(
+      env,
+      telegramId
+    );
 
     await sendMessage(
       env,
       telegramId,
       MENU_TEXT,
-      mainMenuKeyboard(isAdmin(telegramId))
+      mainMenuKeyboard(
+        isAdmin(telegramId)
+      )
     );
 
     return;
   }
 
   if (text === "/admin") {
-    if (isAdmin(telegramId)) {
-      await clearUserState(env, telegramId);
+    if (
+      isAdmin(telegramId)
+    ) {
+      await clearUserState(
+        env,
+        telegramId
+      );
+
       await sendMessage(
         env,
         telegramId,
@@ -458,8 +641,17 @@ async function handleUpdate(env, update) {
   }
 
   if (text === "/support") {
-    await clearUserState(env, telegramId);
-    await setUserState(env, telegramId, "support_message", null);
+    await clearUserState(
+      env,
+      telegramId
+    );
+
+    await setUserState(
+      env,
+      telegramId,
+      "support_message",
+      null
+    );
 
     await sendMessage(
       env,
@@ -471,34 +663,54 @@ async function handleUpdate(env, update) {
     return;
   }
 
-  await handleTextMessage(env, message);
+  await handleTextMessage(
+    env,
+    message
+  );
 }
 
 /* -------------------------------------------------------------------------- */
 /* Callback handling                                                          */
 /* -------------------------------------------------------------------------- */
 
-async function handleCallback(env, callback) {
-  const telegramId = String(callback.from.id);
-  const data = String(callback.data || "");
-  const message = callback.message;
+async function handleCallback(
+  env,
+  callback
+) {
+  const telegramId =
+    String(callback.from.id);
+
+  const data =
+    String(callback.data || "");
+
+  const message =
+    callback.message;
 
   if (data === "menu") {
-    await clearUserState(env, telegramId);
+    await clearUserState(
+      env,
+      telegramId
+    );
 
     await editMessage(
       env,
       telegramId,
       message.message_id,
       MENU_TEXT,
-      mainMenuKeyboard(isAdmin(telegramId))
+      mainMenuKeyboard(
+        isAdmin(telegramId)
+      )
     );
 
     return;
   }
 
   if (data === "buy") {
-    await startBuyFlow(env, telegramId);
+    await startBuyFlow(
+      env,
+      telegramId
+    );
+
     return;
   }
 
@@ -509,7 +721,9 @@ async function handleCallback(env, callback) {
       message.message_id,
       PRICE_TEXT +
         "\n\nPayment address:\n" +
-        formatDisplayAddress(GRAM_RECEIVING_WALLET),
+        formatDisplayAddress(
+          GRAM_RECEIVING_WALLET
+        ),
       backKeyboard()
     );
 
@@ -517,13 +731,26 @@ async function handleCallback(env, callback) {
   }
 
   if (data === "orders") {
-    await showUserOrders(env, telegramId);
+    await showUserOrders(
+      env,
+      telegramId
+    );
+
     return;
   }
 
   if (data === "support") {
-    await clearUserState(env, telegramId);
-    await setUserState(env, telegramId, "support_message", null);
+    await clearUserState(
+      env,
+      telegramId
+    );
+
+    await setUserState(
+      env,
+      telegramId,
+      "support_message",
+      null
+    );
 
     await editMessage(
       env,
@@ -541,7 +768,10 @@ async function handleCallback(env, callback) {
       return;
     }
 
-    await clearUserState(env, telegramId);
+    await clearUserState(
+      env,
+      telegramId
+    );
 
     await editMessage(
       env,
@@ -555,15 +785,30 @@ async function handleCallback(env, callback) {
   }
 
   if (data.startsWith("paid:")) {
-    const orderId = Number(data.split(":")[1]);
+    const orderId =
+      Number(
+        data.split(":")[1]
+      );
 
-    if (!Number.isInteger(orderId)) {
+    if (
+      !Number.isInteger(
+        orderId
+      )
+    ) {
       return;
     }
 
-    const order = await getOrderById(env, orderId);
+    const order =
+      await getOrderById(
+        env,
+        orderId
+      );
 
-    if (!order || String(order.telegram_id) !== telegramId) {
+    if (
+      !order ||
+      String(order.telegram_id) !==
+        telegramId
+    ) {
       return;
     }
 
@@ -575,24 +820,38 @@ async function handleCallback(env, callback) {
       backKeyboard()
     );
 
-    const result = await processSingleOrder(env, orderId);
+    const result =
+      await processSingleOrder(
+        env,
+        orderId
+      );
 
-    if (result === "payout_sent") {
+    if (
+      result === "payout_sent"
+    ) {
       await sendMessage(
         env,
         telegramId,
         `Payment verified and PTN sent.\n\nOrder #${orderId}`,
         backKeyboard()
       );
-    } else if (result === "payment_verified") {
+    } else if (
+      result === "payment_verified"
+    ) {
       await sendMessage(
         env,
         telegramId,
         `Payment verified.\n\nPTN payout is now processing.\n\nOrder #${orderId}`,
         backKeyboard()
       );
-    } else if (result === "payment_not_found") {
-      const updated = await getOrderById(env, orderId);
+    } else if (
+      result === "payment_not_found"
+    ) {
+      const updated =
+        await getOrderById(
+          env,
+          orderId
+        );
 
       await sendMessage(
         env,
@@ -600,7 +859,10 @@ async function handleCallback(env, callback) {
         "No matching blockchain payment was found yet.\n\n" +
           "Make sure the amount is exact and the payment comment is exact.\n\n" +
           "Your order remains active and will be checked automatically.",
-        paymentKeyboard(updated?.id || orderId)
+        paymentKeyboard(
+          updated?.id ||
+            orderId
+        )
       );
     } else {
       await sendMessage(
@@ -608,7 +870,9 @@ async function handleCallback(env, callback) {
         telegramId,
         "Your order is still being processed.\n\n" +
           "The system will continue checking automatically.",
-        paymentKeyboard(orderId)
+        paymentKeyboard(
+          orderId
+        )
       );
     }
 
@@ -616,91 +880,187 @@ async function handleCallback(env, callback) {
   }
 
   if (data.startsWith("order:")) {
-    const orderId = Number(data.split(":")[1]);
+    const orderId =
+      Number(
+        data.split(":")[1]
+      );
 
-    if (!Number.isInteger(orderId)) {
+    if (
+      !Number.isInteger(
+        orderId
+      )
+    ) {
       return;
     }
 
-    await showUserOrder(env, telegramId, orderId);
+    await showUserOrder(
+      env,
+      telegramId,
+      orderId
+    );
+
     return;
   }
 
   if (data === "admin_dashboard") {
-    if (!isAdmin(telegramId)) return;
+    if (!isAdmin(telegramId)) {
+      return;
+    }
 
-    await showAdminDashboard(env, telegramId, message.message_id);
+    await showAdminDashboard(
+      env,
+      telegramId,
+      message.message_id
+    );
+
     return;
   }
 
   if (data === "admin_orders") {
-    if (!isAdmin(telegramId)) return;
+    if (!isAdmin(telegramId)) {
+      return;
+    }
 
-    await showAdminOrders(env, telegramId, message.message_id);
+    await showAdminOrders(
+      env,
+      telegramId,
+      message.message_id
+    );
+
     return;
   }
 
   if (data === "admin_pending") {
-    if (!isAdmin(telegramId)) return;
+    if (!isAdmin(telegramId)) {
+      return;
+    }
 
-    await showAdminPending(env, telegramId, message.message_id);
+    await showAdminPending(
+      env,
+      telegramId,
+      message.message_id
+    );
+
     return;
   }
 
   if (data === "admin_users") {
-    if (!isAdmin(telegramId)) return;
+    if (!isAdmin(telegramId)) {
+      return;
+    }
 
-    await showAdminUsers(env, telegramId, message.message_id);
+    await showAdminUsers(
+      env,
+      telegramId,
+      message.message_id
+    );
+
     return;
   }
 
   if (data === "admin_support") {
-    if (!isAdmin(telegramId)) return;
+    if (!isAdmin(telegramId)) {
+      return;
+    }
 
-    await showAdminSupport(env, telegramId, message.message_id);
+    await showAdminSupport(
+      env,
+      telegramId,
+      message.message_id
+    );
+
     return;
   }
 
   if (data === "admin_suspicious") {
-    if (!isAdmin(telegramId)) return;
+    if (!isAdmin(telegramId)) {
+      return;
+    }
 
-    await showAdminSuspicious(env, telegramId, message.message_id);
+    await showAdminSuspicious(
+      env,
+      telegramId,
+      message.message_id
+    );
+
     return;
   }
 
   if (data === "admin_revenue") {
-    if (!isAdmin(telegramId)) return;
+    if (!isAdmin(telegramId)) {
+      return;
+    }
 
-    await showAdminRevenue(env, telegramId, message.message_id);
+    await showAdminRevenue(
+      env,
+      telegramId,
+      message.message_id
+    );
+
     return;
   }
 
   if (data === "admin_templates") {
-    if (!isAdmin(telegramId)) return;
+    if (!isAdmin(telegramId)) {
+      return;
+    }
 
-    await showAdminTemplates(env, telegramId, message.message_id);
+    await showAdminTemplates(
+      env,
+      telegramId,
+      message.message_id
+    );
+
     return;
   }
 
   if (data.startsWith("ticket:")) {
-    if (!isAdmin(telegramId)) return;
-
-    const ticketId = Number(data.split(":")[1]);
-
-    if (!Number.isInteger(ticketId)) {
+    if (!isAdmin(telegramId)) {
       return;
     }
 
-    await showTicket(env, telegramId, message.message_id, ticketId);
+    const ticketId =
+      Number(
+        data.split(":")[1]
+      );
+
+    if (
+      !Number.isInteger(
+        ticketId
+      )
+    ) {
+      return;
+    }
+
+    await showTicket(
+      env,
+      telegramId,
+      message.message_id,
+      ticketId
+    );
+
     return;
   }
 
-  if (data.startsWith("ticket_reply:")) {
-    if (!isAdmin(telegramId)) return;
+  if (
+    data.startsWith(
+      "ticket_reply:"
+    )
+  ) {
+    if (!isAdmin(telegramId)) {
+      return;
+    }
 
-    const ticketId = Number(data.split(":")[1]);
+    const ticketId =
+      Number(
+        data.split(":")[1]
+      );
 
-    if (!Number.isInteger(ticketId)) {
+    if (
+      !Number.isInteger(
+        ticketId
+      )
+    ) {
       return;
     }
 
@@ -722,36 +1082,71 @@ async function handleCallback(env, callback) {
     return;
   }
 
-  if (data.startsWith("ticket_close:")) {
-    if (!isAdmin(telegramId)) return;
+  if (
+    data.startsWith(
+      "ticket_close:"
+    )
+  ) {
+    if (!isAdmin(telegramId)) {
+      return;
+    }
 
-    const ticketId = Number(data.split(":")[1]);
+    const ticketId =
+      Number(
+        data.split(":")[1]
+      );
 
-    if (!Number.isInteger(ticketId)) {
+    if (
+      !Number.isInteger(
+        ticketId
+      )
+    ) {
       return;
     }
 
     await env.DB.prepare(
       `UPDATE support_tickets
-       SET status='closed', updated_at=?
+       SET status='closed',
+           updated_at=?
        WHERE id=?`
     )
-      .bind(now(), ticketId)
+      .bind(
+        now(),
+        ticketId
+      )
       .run();
 
-    await showAdminSupport(env, telegramId, message.message_id);
+    await showAdminSupport(
+      env,
+      telegramId,
+      message.message_id
+    );
 
     return;
   }
 
   if (data.startsWith("qr:")) {
-    if (!isAdmin(telegramId)) return;
+    if (!isAdmin(telegramId)) {
+      return;
+    }
 
-    const parts = data.split(":");
-    const templateId = Number(parts[1]);
-    const ticketId = Number(parts[2]);
+    const parts =
+      data.split(":");
 
-    if (!QUICK_REPLIES[templateId] || !Number.isInteger(ticketId)) {
+    const templateId =
+      Number(parts[1]);
+
+    const ticketId =
+      Number(parts[2]);
+
+    if (
+      !QUICK_REPLIES[
+        templateId
+      ] ||
+      !Number.isInteger(
+        ticketId
+      )
+    ) {
       return;
     }
 
@@ -759,23 +1154,32 @@ async function handleCallback(env, callback) {
       env,
       telegramId,
       ticketId,
-      QUICK_REPLIES[templateId]
+      QUICK_REPLIES[
+        templateId
+      ]
     );
 
     return;
   }
 
   if (data.startsWith("block:")) {
-    if (!isAdmin(telegramId)) return;
+    if (!isAdmin(telegramId)) {
+      return;
+    }
 
-    const targetId = data.split(":")[1];
+    const targetId =
+      data.split(":")[1];
 
     await env.DB.prepare(
       `UPDATE users
-       SET is_blocked=1, updated_at=?
+       SET is_blocked=1,
+           updated_at=?
        WHERE telegram_id=?`
     )
-      .bind(now(), targetId)
+      .bind(
+        now(),
+        targetId
+      )
       .run();
 
     await sendMessage(
@@ -788,54 +1192,103 @@ async function handleCallback(env, callback) {
       env,
       telegramId,
       `User ${targetId} has been blocked.`,
-      userAdminKeyboard(targetId, true)
+      userAdminKeyboard(
+        targetId,
+        true
+      )
     );
 
     return;
   }
 
-  if (data.startsWith("unblock:")) {
-    if (!isAdmin(telegramId)) return;
+  if (
+    data.startsWith(
+      "unblock:"
+    )
+  ) {
+    if (!isAdmin(telegramId)) {
+      return;
+    }
 
-    const targetId = data.split(":")[1];
+    const targetId =
+      data.split(":")[1];
 
     await env.DB.prepare(
       `UPDATE users
-       SET is_blocked=0, updated_at=?
+       SET is_blocked=0,
+           updated_at=?
        WHERE telegram_id=?`
     )
-      .bind(now(), targetId)
+      .bind(
+        now(),
+        targetId
+      )
       .run();
 
     await sendMessage(
       env,
       telegramId,
       `User ${targetId} has been unblocked.`,
-      userAdminKeyboard(targetId, false)
+      userAdminKeyboard(
+        targetId,
+        false
+      )
     );
 
     return;
   }
 
-  if (data.startsWith("admin_order:")) {
-    if (!isAdmin(telegramId)) return;
-
-    const orderId = Number(data.split(":")[1]);
-
-    if (!Number.isInteger(orderId)) {
+  if (
+    data.startsWith(
+      "admin_order:"
+    )
+  ) {
+    if (!isAdmin(telegramId)) {
       return;
     }
 
-    await showAdminOrder(env, telegramId, message.message_id, orderId);
+    const orderId =
+      Number(
+        data.split(":")[1]
+      );
+
+    if (
+      !Number.isInteger(
+        orderId
+      )
+    ) {
+      return;
+    }
+
+    await showAdminOrder(
+      env,
+      telegramId,
+      message.message_id,
+      orderId
+    );
+
     return;
   }
 
-  if (data.startsWith("retry_order:")) {
-    if (!isAdmin(telegramId)) return;
+  if (
+    data.startsWith(
+      "retry_order:"
+    )
+  ) {
+    if (!isAdmin(telegramId)) {
+      return;
+    }
 
-    const orderId = Number(data.split(":")[1]);
+    const orderId =
+      Number(
+        data.split(":")[1]
+      );
 
-    if (!Number.isInteger(orderId)) {
+    if (
+      !Number.isInteger(
+        orderId
+      )
+    ) {
       return;
     }
 
@@ -848,10 +1301,16 @@ async function handleCallback(env, callback) {
        WHERE id=?
          AND status IN ('payout_processing','payment_verified')`
     )
-      .bind(now(), orderId)
+      .bind(
+        now(),
+        orderId
+      )
       .run();
 
-    await processSingleOrder(env, orderId);
+    await processSingleOrder(
+      env,
+      orderId
+    );
 
     await showAdminOrder(
       env,
@@ -868,66 +1327,114 @@ async function handleCallback(env, callback) {
 /* User text flow                                                             */
 /* -------------------------------------------------------------------------- */
 
-async function handleTextMessage(env, message) {
-  const telegramId = String(message.from.id);
-  const text = String(message.text || "").trim();
+async function handleTextMessage(
+  env,
+  message
+) {
+  const telegramId =
+    String(
+      message.from.id
+    );
 
-  const user = await getUser(env, telegramId);
+  const text =
+    String(
+      message.text || ""
+    ).trim();
+
+  const user =
+    await getUser(
+      env,
+      telegramId
+    );
 
   if (!user) {
-    await upsertUser(env, message.from);
+    await upsertUser(
+      env,
+      message.from
+    );
   }
 
-  if (text.toLowerCase() === "cancel") {
-    await clearUserState(env, telegramId);
+  if (
+    text.toLowerCase() ===
+    "cancel"
+  ) {
+    await clearUserState(
+      env,
+      telegramId
+    );
 
     await sendMessage(
       env,
       telegramId,
       CANCEL_TEXT,
-      mainMenuKeyboard(isAdmin(telegramId))
+      mainMenuKeyboard(
+        isAdmin(telegramId)
+      )
     );
 
     return;
   }
 
-  if (isAdmin(telegramId) && user?.state === "admin_reply_ticket") {
+  if (
+    isAdmin(telegramId) &&
+    user?.state ===
+      "admin_reply_ticket"
+  ) {
     await handleAdminReplyText(
       env,
       telegramId,
-      Number(user.draft_order_id),
+      Number(
+        user.draft_order_id
+      ),
       text
     );
+
     return;
   }
 
-  if (user?.state === "awaiting_amount") {
+  if (
+    user?.state ===
+    "awaiting_amount"
+  ) {
     await handleGramAmountInput(
       env,
       telegramId,
       text,
-      Number(user.draft_order_id)
+      Number(
+        user.draft_order_id
+      )
     );
+
     return;
   }
 
-  if (user?.state === "awaiting_wallet") {
+  if (
+    user?.state ===
+    "awaiting_wallet"
+  ) {
     await handleWalletInput(
       env,
       telegramId,
       text,
-      Number(user.draft_order_id)
+      Number(
+        user.draft_order_id
+      )
     );
+
     return;
   }
 
-  if (user?.state === "support_message") {
+  if (
+    user?.state ===
+    "support_message"
+  ) {
     await handleSupportMessage(
       env,
       telegramId,
       message.from,
       text
     );
+
     return;
   }
 
@@ -935,7 +1442,9 @@ async function handleTextMessage(env, message) {
     env,
     telegramId,
     "Please choose an option from the menu.",
-    mainMenuKeyboard(isAdmin(telegramId))
+    mainMenuKeyboard(
+      isAdmin(telegramId)
+    )
   );
 }
 
@@ -943,10 +1452,20 @@ async function handleTextMessage(env, message) {
 /* Buy flow                                                                   */
 /* -------------------------------------------------------------------------- */
 
-async function startBuyFlow(env, telegramId) {
-  await clearUserState(env, telegramId);
+async function startBuyFlow(
+  env,
+  telegramId
+) {
+  await clearUserState(
+    env,
+    telegramId
+  );
 
-  const draft = await createDraftOrder(env, telegramId);
+  const draft =
+    await createDraftOrder(
+      env,
+      telegramId
+    );
 
   await setUserState(
     env,
@@ -972,27 +1491,46 @@ async function handleGramAmountInput(
   text,
   orderId
 ) {
-  const order = await getOrderById(env, orderId);
+  const order =
+    await getOrderById(
+      env,
+      orderId
+    );
 
-  if (!order || String(order.telegram_id) !== telegramId) {
-    await startBuyFlow(env, telegramId);
+  if (
+    !order ||
+    String(order.telegram_id) !==
+      telegramId
+  ) {
+    await startBuyFlow(
+      env,
+      telegramId
+    );
+
     return;
   }
 
   let gramMicro;
 
   try {
-    gramMicro = parseGramAmount(text);
+    gramMicro =
+      parseGramAmount(
+        text
+      );
   } catch (error) {
     await sendMessage(
       env,
       telegramId,
       error.message
     );
+
     return;
   }
 
-  const ptnAmount = gramMicroToPtn(gramMicro);
+  const ptnAmount =
+    gramMicroToPtn(
+      gramMicro
+    );
 
   await env.DB.prepare(
     `UPDATE orders
@@ -1003,7 +1541,9 @@ async function handleGramAmountInput(
      WHERE id=?`
   )
     .bind(
-      formatGramMicro(gramMicro),
+      formatGramMicro(
+        gramMicro
+      ),
       ptnAmount.toString(),
       now(),
       orderId
@@ -1032,30 +1572,47 @@ async function handleWalletInput(
   text,
   orderId
 ) {
-  const order = await getOrderById(env, orderId);
+  const order =
+    await getOrderById(
+      env,
+      orderId
+    );
 
-  if (!order || String(order.telegram_id) !== telegramId) {
-    await startBuyFlow(env, telegramId);
+  if (
+    !order ||
+    String(order.telegram_id) !==
+      telegramId
+  ) {
+    await startBuyFlow(
+      env,
+      telegramId
+    );
+
     return;
   }
 
   let walletAddress;
 
   try {
-    walletAddress = normalizeUserAddress(text);
+    walletAddress =
+      normalizeUserAddress(
+        text
+      );
   } catch (error) {
     await sendMessage(
       env,
       telegramId,
       "Invalid TON wallet address.\n\nPlease send a valid mainnet TON address."
     );
+
     return;
   }
 
-  const paymentComment = await createUniquePaymentComment(
-    env,
-    orderId
-  );
+  const paymentComment =
+    await createUniquePaymentComment(
+      env,
+      orderId
+    );
 
   await env.DB.prepare(
     `UPDATE orders
@@ -1073,7 +1630,10 @@ async function handleWalletInput(
     )
     .run();
 
-  await clearUserState(env, telegramId);
+  await clearUserState(
+    env,
+    telegramId
+  );
 
   await sendPaymentInstructions(
     env,
@@ -1087,7 +1647,11 @@ async function sendPaymentInstructions(
   telegramId,
   orderId
 ) {
-  const order = await getOrderById(env, orderId);
+  const order =
+    await getOrderById(
+      env,
+      orderId
+    );
 
   if (!order) {
     return;
@@ -1114,7 +1678,9 @@ async function sendPaymentInstructions(
     env,
     telegramId,
     text,
-    paymentKeyboard(order.id)
+    paymentKeyboard(
+      order.id
+    )
   );
 }
 
@@ -1122,18 +1688,23 @@ async function sendPaymentInstructions(
 /* User orders                                                                */
 /* -------------------------------------------------------------------------- */
 
-async function showUserOrders(env, telegramId) {
-  const result = await env.DB.prepare(
-    `SELECT *
-     FROM orders
-     WHERE telegram_id=?
-     ORDER BY id DESC
-     LIMIT 10`
-  )
-    .bind(telegramId)
-    .all();
+async function showUserOrders(
+  env,
+  telegramId
+) {
+  const result =
+    await env.DB.prepare(
+      `SELECT *
+       FROM orders
+       WHERE telegram_id=?
+       ORDER BY id DESC
+       LIMIT 10`
+    )
+      .bind(telegramId)
+      .all();
 
-  const rows = result.results || [];
+  const rows =
+    result.results || [];
 
   if (!rows.length) {
     await sendMessage(
@@ -1146,9 +1717,12 @@ async function showUserOrders(env, telegramId) {
     return;
   }
 
-  let text = "My Orders\n\n";
+  let text =
+    "My Orders\n\n";
 
-  for (const order of rows) {
+  for (
+    const order of rows
+  ) {
     text +=
       `#${order.id} | ` +
       `${order.gram_amount || "-"} GRAM | ` +
@@ -1158,14 +1732,21 @@ async function showUserOrders(env, telegramId) {
 
   const keyboard = {
     inline_keyboard: [
-      ...rows.slice(0, 8).map((order) => [
-        {
-          text: `Order #${order.id}`,
-          callback_data: `order:${order.id}`
-        }
-      ]),
+      ...rows.slice(0, 8).map(
+        (order) => [
+          {
+            text:
+              `Order #${order.id}`,
+            callback_data:
+              `order:${order.id}`
+          }
+        ]
+      ),
       [
-        { text: "Back", callback_data: "menu" }
+        {
+          text: "Back",
+          callback_data: "menu"
+        }
       ]
     ]
   };
@@ -1178,10 +1759,22 @@ async function showUserOrders(env, telegramId) {
   );
 }
 
-async function showUserOrder(env, telegramId, orderId) {
-  const order = await getOrderById(env, orderId);
+async function showUserOrder(
+  env,
+  telegramId,
+  orderId
+) {
+  const order =
+    await getOrderById(
+      env,
+      orderId
+    );
 
-  if (!order || String(order.telegram_id) !== telegramId) {
+  if (
+    !order ||
+    String(order.telegram_id) !==
+      telegramId
+  ) {
     await sendMessage(
       env,
       telegramId,
@@ -1213,28 +1806,39 @@ async function showUserOrder(env, telegramId, orderId) {
       `\nPTN transaction:\n${order.payout_tx_hash}\n`;
   }
 
-  if (order.status === "pending") {
+  if (
+    order.status ===
+    "pending"
+  ) {
     text +=
       `\nPayment comment:\n${order.payment_comment || "-"}\n`;
   }
 
   const keyboard = {
     inline_keyboard: [
-      ...(order.status === "pending"
+      ...(order.status ===
+      "pending"
         ? [
             [
               {
                 text: "I Have Paid",
-                callback_data: `paid:${order.id}`
+                callback_data:
+                  `paid:${order.id}`
               }
             ]
           ]
         : []),
       [
-        { text: "My Orders", callback_data: "orders" }
+        {
+          text: "My Orders",
+          callback_data: "orders"
+        }
       ],
       [
-        { text: "Back", callback_data: "menu" }
+        {
+          text: "Back",
+          callback_data: "menu"
+        }
       ]
     ]
   };
@@ -1251,42 +1855,67 @@ async function showUserOrder(env, telegramId, orderId) {
 /* Payment verification                                                       */
 /* -------------------------------------------------------------------------- */
 
-async function processOrders(env) {
-  const pendingResult = await env.DB.prepare(
-    `SELECT *
-     FROM orders
-     WHERE status IN ('pending','payment_verified','payout_processing')
-     ORDER BY id ASC
-     LIMIT 25`
-  ).all();
+async function processOrders(
+  env
+) {
+  const pendingResult =
+    await env.DB.prepare(
+      `SELECT *
+       FROM orders
+       WHERE status IN (
+         'pending',
+         'payment_verified',
+         'payout_processing'
+       )
+       ORDER BY id ASC
+       LIMIT 25`
+    ).all();
 
-  const orders = pendingResult.results || [];
+  const orders =
+    pendingResult.results || [];
 
-  for (const order of orders) {
+  for (
+    const order of orders
+  ) {
     try {
-      await processSingleOrder(env, Number(order.id));
+      await processSingleOrder(
+        env,
+        Number(order.id)
+      );
     } catch (error) {
       console.error(
         `PROCESS ORDER ERROR ${order.id}:`,
-        error
+        describeError(error)
       );
     }
   }
 }
 
-async function processSingleOrder(env, orderId) {
-  let order = await getOrderById(env, orderId);
+async function processSingleOrder(
+  env,
+  orderId
+) {
+  let order =
+    await getOrderById(
+      env,
+      orderId
+    );
 
   if (!order) {
     return "not_found";
   }
 
-  const currentTime = now();
+  const currentTime =
+    now();
 
   if (
-    order.status === "pending" &&
+    order.status ===
+      "pending" &&
     currentTime -
-      Number(order.created_at || currentTime) >
+      Number(
+        order.created_at ||
+          currentTime
+      ) >
       PAYMENT_EXPIRY_SECONDS
   ) {
     await env.DB.prepare(
@@ -1296,32 +1925,49 @@ async function processSingleOrder(env, orderId) {
        WHERE id=?
          AND status='pending'`
     )
-      .bind(currentTime, orderId)
+      .bind(
+        currentTime,
+        orderId
+      )
       .run();
 
     return "expired";
   }
 
-  if (order.status === "pending") {
-    if (!order.payment_address || !order.payment_comment) {
+  if (
+    order.status ===
+    "pending"
+  ) {
+    if (
+      !order.payment_address ||
+      !order.payment_comment
+    ) {
       return "payment_not_ready";
     }
 
-    const payment = await findPayment(env, order);
+    const payment =
+      await findPayment(
+        env,
+        order
+      );
 
     if (!payment) {
       return "payment_not_found";
     }
 
-    const reused = await env.DB.prepare(
-      `SELECT id
-       FROM orders
-       WHERE payment_tx_hash=?
-         AND id<>?
-       LIMIT 1`
-    )
-      .bind(payment.transactionHash, orderId)
-      .first();
+    const reused =
+      await env.DB.prepare(
+        `SELECT id
+         FROM orders
+         WHERE payment_tx_hash=?
+           AND id<>?
+         LIMIT 1`
+      )
+        .bind(
+          payment.transactionHash,
+          orderId
+        )
+        .first();
 
     if (reused) {
       console.error(
@@ -1331,26 +1977,31 @@ async function processSingleOrder(env, orderId) {
       return "payment_not_found";
     }
 
-    const update = await env.DB.prepare(
-      `UPDATE orders
-       SET status='payment_verified',
-           payment_tx_hash=?,
-           paid_at=?,
-           updated_at=?,
-           failure_reason=NULL
-       WHERE id=?
-         AND status='pending'`
-    )
-      .bind(
-        payment.transactionHash,
-        payment.timestamp,
-        currentTime,
-        orderId
+    const update =
+      await env.DB.prepare(
+        `UPDATE orders
+         SET status='payment_verified',
+             payment_tx_hash=?,
+             paid_at=?,
+             updated_at=?,
+             failure_reason=NULL
+         WHERE id=?
+           AND status='pending'`
       )
-      .run();
+        .bind(
+          payment.transactionHash,
+          payment.timestamp,
+          currentTime,
+          orderId
+        )
+        .run();
 
     if (!update.meta?.changes) {
-      order = await getOrderById(env, orderId);
+      order =
+        await getOrderById(
+          env,
+          orderId
+        );
 
       if (!order) {
         return "not_found";
@@ -1364,81 +2015,124 @@ async function processSingleOrder(env, orderId) {
       );
     }
 
-    order = await getOrderById(env, orderId);
+    order =
+      await getOrderById(
+        env,
+        orderId
+      );
 
     if (!order) {
       return "not_found";
     }
   }
 
-  if (order.status === "payout_processing") {
-    const processingUntil = Number(
-      order.processing_until || 0
-    );
+  /*
+   * If a payout is already processing, do not immediately retry it.
+   *
+   * This is important because the blockchain transaction can already
+   * exist while TON Center indexing is still catching up.
+   */
+  if (
+    order.status ===
+    "payout_processing"
+  ) {
+    const processingUntil =
+      Number(
+        order.processing_until ||
+          0
+      );
 
-    if (processingUntil > currentTime) {
+    if (
+      processingUntil >
+      currentTime
+    ) {
       return "payout_processing";
     }
 
-    const reset = await env.DB.prepare(
-      `UPDATE orders
-       SET status='payment_verified',
-           processing_until=NULL,
-           updated_at=?
-       WHERE id=?
-         AND status='payout_processing'`
-    )
-      .bind(currentTime, orderId)
-      .run();
+    const reset =
+      await env.DB.prepare(
+        `UPDATE orders
+         SET status='payment_verified',
+             processing_until=NULL,
+             updated_at=?
+         WHERE id=?
+           AND status='payout_processing'`
+      )
+        .bind(
+          currentTime,
+          orderId
+        )
+        .run();
 
     if (!reset.meta?.changes) {
       return "payout_processing";
     }
 
-    order = await getOrderById(env, orderId);
+    order =
+      await getOrderById(
+        env,
+        orderId
+      );
 
     if (!order) {
       return "not_found";
     }
   }
 
-  if (order.status !== "payment_verified") {
-    if (order.status === "payout_sent") {
+  if (
+    order.status !==
+    "payment_verified"
+  ) {
+    if (
+      order.status ===
+      "payout_sent"
+    ) {
       return "payout_sent";
     }
 
     return order.status;
   }
 
-  const claimUntil = currentTime + 600;
+  const claimUntil =
+    currentTime +
+    PAYOUT_PROCESSING_LOCK_SECONDS;
 
-  const claim = await env.DB.prepare(
-    `UPDATE orders
-     SET status='payout_processing',
-         processing_until=?,
-         retry_count=COALESCE(retry_count,0)+1,
-         updated_at=?
-     WHERE id=?
-       AND status='payment_verified'`
-  )
-    .bind(
-      claimUntil,
-      currentTime,
-      orderId
+  const claim =
+    await env.DB.prepare(
+      `UPDATE orders
+       SET status='payout_processing',
+           processing_until=?,
+           retry_count=COALESCE(retry_count,0)+1,
+           updated_at=?
+       WHERE id=?
+         AND status='payment_verified'`
     )
-    .run();
+      .bind(
+        claimUntil,
+        currentTime,
+        orderId
+      )
+      .run();
 
   if (!claim.meta?.changes) {
     return "payout_processing";
   }
 
-  order = await getOrderById(env, orderId);
+  order =
+    await getOrderById(
+      env,
+      orderId
+    );
 
   if (!order) {
     return "not_found";
   }
 
-  const payout = await sendPTN(env, order);
+  const payout =
+    await sendPTN(
+      env,
+      order
+    );
 
   if (payout.success) {
     await env.DB.prepare(
@@ -1473,15 +2167,34 @@ async function processSingleOrder(env, orderId) {
     return "payout_sent";
   }
 
+  /*
+   * Do not reset a pending payout to payment_verified immediately.
+   *
+   * The transaction may already be broadcast and only the indexer
+   * may be delayed. Keeping payout_processing prevents duplicate
+   * payouts and prevents repeated Telegram messages.
+   */
   if (payout.pending) {
-    await sendMessage(
-      env,
-      order.telegram_id,
-      `Your payment is verified.\n\n` +
-        `The PTN transaction has been submitted or is still being confirmed.\n` +
-        `The system will continue checking automatically.\n\n` +
-        `Order #${order.id}`
-    );
+    const nextCheck =
+      currentTime +
+      PAYOUT_PROCESSING_LOCK_SECONDS;
+
+    await env.DB.prepare(
+      `UPDATE orders
+       SET status='payout_processing',
+           processing_until=?,
+           failure_reason=?,
+           updated_at=?
+       WHERE id=?
+         AND status='payout_processing'`
+    )
+      .bind(
+        nextCheck,
+        "PTN payout submitted or awaiting blockchain confirmation",
+        currentTime,
+        orderId
+      )
+      .run();
 
     return "payout_processing";
   }
@@ -1496,13 +2209,18 @@ async function processSingleOrder(env, orderId) {
        AND status='payout_processing'`
   )
     .bind(
-      payout.error || "Payout failed",
+      payout.error ||
+        "Payout failed",
       currentTime,
       orderId
     )
     .run();
 
-  const retryCount = Number(order.retry_count || 0);
+  const retryCount =
+    Number(
+      order.retry_count || 0
+    );
+
   const shouldNotify =
     retryCount <= 1 ||
     retryCount % 3 === 0;
@@ -1520,57 +2238,118 @@ async function processSingleOrder(env, orderId) {
   return "payout_failed";
 }
 
-async function findPayment(env, order) {
-  const apiKey = String(
-    env.TONCENTER_API_KEY || ""
-  ).trim();
+async function findPayment(
+  env,
+  order
+) {
+  const apiKey =
+    String(
+      env.TONCENTER_API_KEY ||
+        ""
+    ).trim();
 
   if (!apiKey) {
-    console.error("TONCENTER_API_KEY missing");
+    console.error(
+      "TONCENTER_API_KEY missing"
+    );
+
     return null;
   }
 
-  const source = canonicalAddress(
-    order.payment_address
-  );
+  const source =
+    canonicalAddress(
+      order.payment_address
+    );
 
-  const destination = canonicalAddress(
-    GRAM_RECEIVING_WALLET
-  );
+  const destination =
+    canonicalAddress(
+      GRAM_RECEIVING_WALLET
+    );
 
-  const startUtime = Math.max(
-    0,
-    Number(order.created_at || now()) - 120
-  );
+  const startUtime =
+    Math.max(
+      0,
+      Number(
+        order.created_at ||
+          now()
+      ) - 120
+    );
 
-  const endUtime = now() + 30;
+  const endUtime =
+    now() + 30;
 
   try {
-    for (let page = 0; page < PAYMENT_SEARCH_PAGES; page++) {
-      const params = new URLSearchParams();
+    for (
+      let page = 0;
+      page < PAYMENT_SEARCH_PAGES;
+      page++
+    ) {
+      const params =
+        new URLSearchParams();
 
-      params.set("source", source);
-      params.set("destination", destination);
-      params.set("direction", "in");
-      params.set("exclude_externals", "true");
-      params.set("start_utime", String(startUtime));
-      params.set("end_utime", String(endUtime));
-      params.set("limit", "1000");
-      params.set("offset", String(page * 1000));
-      params.set("sort", "desc");
+      params.set(
+        "source",
+        source
+      );
+
+      params.set(
+        "destination",
+        destination
+      );
+
+      params.set(
+        "direction",
+        "in"
+      );
+
+      params.set(
+        "exclude_externals",
+        "true"
+      );
+
+      params.set(
+        "start_utime",
+        String(startUtime)
+      );
+
+      params.set(
+        "end_utime",
+        String(endUtime)
+      );
+
+      params.set(
+        "limit",
+        "1000"
+      );
+
+      params.set(
+        "offset",
+        String(page * 1000)
+      );
+
+      params.set(
+        "sort",
+        "desc"
+      );
 
       const url =
         "https://toncenter.com/api/v3/messages?" +
         params.toString();
 
-      const response = await fetch(url, {
-        headers: {
-          "X-API-Key": apiKey
-        }
-      });
+      const response =
+        await fetch(
+          url,
+          {
+            headers: {
+              "X-API-Key":
+                apiKey
+            }
+          }
+        );
 
       if (!response.ok) {
-        const body = await response.text();
+        const body =
+          await response.text();
 
         console.error(
           "PAYMENT SEARCH ERROR:",
@@ -1581,51 +2360,87 @@ async function findPayment(env, order) {
         return null;
       }
 
-      const data = await response.json();
+      const data =
+        await response.json();
 
-      const messages = Array.isArray(data?.messages)
-        ? data.messages
-        : [];
+      const messages =
+        Array.isArray(
+          data?.messages
+        )
+          ? data.messages
+          : [];
 
       if (!messages.length) {
         break;
       }
 
-      for (const message of messages) {
-        if (!sameAddress(message?.source, source)) {
-          continue;
-        }
-
-        if (!sameAddress(message?.destination, destination)) {
-          continue;
-        }
-
-        if (message?.bounced === true) {
-          continue;
-        }
-
+      for (
+        const message of messages
+      ) {
         if (
-          String(message?.created_at || "") !== "" &&
-          Number(message.created_at) < startUtime
+          !sameAddress(
+            message?.source,
+            source
+          )
         ) {
           continue;
         }
 
-        const value = String(message?.value ?? "0");
-
-        const expectedValue = gramToNano(
-          order.gram_amount
-        );
-
-        if (value !== expectedValue.toString()) {
+        if (
+          !sameAddress(
+            message?.destination,
+            destination
+          )
+        ) {
           continue;
         }
 
-        const comment = await extractMessageComment(
-          message
-        );
+        if (
+          message?.bounced ===
+          true
+        ) {
+          continue;
+        }
 
-        if (comment !== order.payment_comment) {
+        if (
+          String(
+            message?.created_at ||
+              ""
+          ) !== "" &&
+          Number(
+            message.created_at
+          ) < startUtime
+        ) {
+          continue;
+        }
+
+        const value =
+          String(
+            message?.value ??
+              "0"
+          );
+
+        const expectedValue =
+          gramToNano(
+            order.gram_amount
+          );
+
+        if (
+          value !==
+          expectedValue.toString()
+        ) {
+          continue;
+        }
+
+        const comment =
+          await extractMessageComment(
+            message
+          );
+
+        if (
+          comment !==
+          order.payment_comment
+        ) {
           continue;
         }
 
@@ -1639,97 +2454,144 @@ async function findPayment(env, order) {
           continue;
         }
 
-        const transactionTimestamp = Number(
-          message?.created_at || now()
-        );
+        const transactionTimestamp =
+          Number(
+            message?.created_at ||
+              now()
+          );
 
         return {
           transactionHash,
-          timestamp: transactionTimestamp,
+          timestamp:
+            transactionTimestamp,
           message
         };
       }
 
-      if (messages.length < 1000) {
+      if (
+        messages.length <
+        1000
+      ) {
         break;
       }
     }
   } catch (error) {
     console.error(
       "PAYMENT SEARCH EXCEPTION:",
-      error
+      describeError(error)
     );
   }
 
   return null;
 }
 
-async function extractMessageComment(message) {
+async function extractMessageComment(
+  message
+) {
   const decoded =
-    message?.message_content?.decoded;
+    message?.message_content
+      ?.decoded;
 
-  const decodedComment = findDecodedComment(decoded);
+  const decodedComment =
+    findDecodedComment(
+      decoded
+    );
 
-  if (decodedComment !== null) {
+  if (
+    decodedComment !== null
+  ) {
     return decodedComment;
   }
 
   const body =
-    message?.message_content?.body;
+    message?.message_content
+      ?.body;
 
   if (!body) {
     return "";
   }
 
   try {
-    const normalized = normalizeBase64(body);
-    const boc = Buffer.from(normalized, "base64");
-    const cells = Cell.fromBoc(boc);
+    const normalized =
+      normalizeBase64(
+        body
+      );
+
+    const boc =
+      Buffer.from(
+        normalized,
+        "base64"
+      );
+
+    const cells =
+      Cell.fromBoc(
+        boc
+      );
 
     if (!cells.length) {
       return "";
     }
 
-    const slice = cells[0].beginParse();
+    const slice =
+      cells[0].beginParse();
 
-    if (slice.remainingBits < 32) {
+    if (
+      slice.remainingBits <
+      32
+    ) {
       return "";
     }
 
-    const opcode = slice.loadUint(32);
+    const opcode =
+      slice.loadUint(32);
 
     if (opcode !== 0) {
       return "";
     }
 
     return slice.loadStringTail();
-  } catch (error) {
+  } catch {
     return "";
   }
 }
 
-function findDecodedComment(value) {
-  if (!value || typeof value !== "object") {
+function findDecodedComment(
+  value
+) {
+  if (
+    !value ||
+    typeof value !==
+      "object"
+  ) {
     return null;
   }
 
   if (
-    typeof value.comment === "string"
+    typeof value.comment ===
+    "string"
   ) {
     return value.comment;
   }
 
   if (
-    typeof value.text === "string"
+    typeof value.text ===
+    "string"
   ) {
     return value.text;
   }
 
   if (Array.isArray(value)) {
-    for (const item of value) {
-      const found = findDecodedComment(item);
+    for (
+      const item of value
+    ) {
+      const found =
+        findDecodedComment(
+          item
+        );
 
-      if (found !== null) {
+      if (
+        found !== null
+      ) {
         return found;
       }
     }
@@ -1737,14 +2599,24 @@ function findDecodedComment(value) {
     return null;
   }
 
-  for (const item of Object.values(value)) {
+  for (
+    const item of Object.values(
+      value
+    )
+  ) {
     if (
       item &&
-      typeof item === "object"
+      typeof item ===
+        "object"
     ) {
-      const found = findDecodedComment(item);
+      const found =
+        findDecodedComment(
+          item
+        );
 
-      if (found !== null) {
+      if (
+        found !== null
+      ) {
         return found;
       }
     }
@@ -1757,17 +2629,37 @@ function findDecodedComment(value) {
 /* PTN payout                                                                 */
 /* -------------------------------------------------------------------------- */
 
-async function sendPTN(env, order) {
+async function sendPTN(
+  env,
+  order
+) {
   try {
-    const mnemonic = String(
-      env.PTN_MNEMONIC || ""
-    ).trim();
+    const rawMnemonic =
+      String(
+        env.PTN_MNEMONIC ||
+          ""
+      ).trim();
 
-    if (!mnemonic) {
-      throw new Error("PTN_MNEMONIC missing");
+    if (!rawMnemonic) {
+      throw new Error(
+        "PTN_MNEMONIC missing"
+      );
     }
 
-    const words = mnemonic.split(/\s+/);
+    /*
+     * Normalize the mnemonic without ever logging the words.
+     *
+     * NFKC helps when a secret was copied from a password manager
+     * or another interface that introduced Unicode normalization.
+     */
+    const mnemonic =
+      rawMnemonic
+        .normalize("NFKC")
+        .trim()
+        .replace(/\s+/g, " ");
+
+    const words =
+      mnemonic.split(" ");
 
     if (
       words.length !== 12 &&
@@ -1778,9 +2670,11 @@ async function sendPTN(env, order) {
       );
     }
 
-    const apiKey = String(
-      env.TONCENTER_API_KEY || ""
-    ).trim();
+    const apiKey =
+      String(
+        env.TONCENTER_API_KEY ||
+          ""
+      ).trim();
 
     if (!apiKey) {
       throw new Error(
@@ -1788,42 +2682,111 @@ async function sendPTN(env, order) {
       );
     }
 
-    const keyPair =
-      await mnemonicToPrivateKey(words);
+    /*
+     * Important:
+     * This is the exact point where the current observed error occurs.
+     *
+     * We log only safe diagnostic metadata if derivation fails.
+     * The mnemonic itself is NEVER logged.
+     */
+    let keyPair;
 
-    const client = new TonClient({
-      endpoint:
-        "https://toncenter.com/api/v2/jsonRPC",
-      apiKey
-    });
+    try {
+      keyPair =
+        await mnemonicToPrivateKey(
+          words
+        );
+    } catch (error) {
+      console.error(
+        `PTN MNEMONIC DERIVATION ERROR ORDER ${order.id}:`,
+        JSON.stringify(
+          {
+            name:
+              error?.name ||
+              "UnknownError",
+            message:
+              error?.message ||
+              String(error),
+            stack:
+              error?.stack ||
+              null,
+            wordCount:
+              words.length
+          }
+        )
+      );
+
+      throw new Error(
+        `PTN mnemonic derivation failed: ${
+          error?.message ||
+          String(error)
+        }`
+      );
+    }
+
+    if (
+      !keyPair ||
+      !keyPair.publicKey ||
+      !keyPair.secretKey
+    ) {
+      throw new Error(
+        "PTN mnemonic derivation returned an invalid key pair"
+      );
+    }
+
+    const client =
+      new TonClient({
+        endpoint:
+          "https://toncenter.com/api/v2/jsonRPC",
+        apiKey
+      });
 
     const senderWallet =
       WalletContractV5R1.create({
         workchain: 0,
-        publicKey: keyPair.publicKey,
+        publicKey:
+          keyPair.publicKey,
         walletId: {
           networkGlobalId: -239
         }
       });
 
     const derivedAddress =
-      senderWallet.address.toString({
-        bounceable: false,
-        testOnly: false,
-        urlSafe: true
-      });
+      senderWallet.address.toString(
+        {
+          bounceable: false,
+          testOnly: false,
+          urlSafe: true
+        }
+      );
 
     const configuredAddress =
       Address.parse(
         PTN_SENDER_WALLET
-      ).toString({
-        bounceable: false,
-        testOnly: false,
-        urlSafe: true
-      });
+      ).toString(
+        {
+          bounceable: false,
+          testOnly: false,
+          urlSafe: true
+        }
+      );
+
+    console.log(
+      `PTN WALLET CHECK ORDER ${order.id}:`,
+      JSON.stringify(
+        {
+          derivedAddress,
+          configuredAddress,
+          matches:
+            derivedAddress ===
+            configuredAddress
+        }
+      )
+    );
 
     if (
-      derivedAddress !== configuredAddress
+      derivedAddress !==
+      configuredAddress
     ) {
       throw new Error(
         "Derived sender wallet does not match PTN_SENDER_WALLET. " +
@@ -1833,7 +2796,9 @@ async function sendPTN(env, order) {
     }
 
     const wallet =
-      client.open(senderWallet);
+      client.open(
+        senderWallet
+      );
 
     const deployed =
       await client.isContractDeployed(
@@ -1851,13 +2816,26 @@ async function sendPTN(env, order) {
         senderWallet.address
       );
 
+    console.log(
+      `PTN SENDER BALANCE ORDER ${order.id}:`,
+      JSON.stringify(
+        {
+          deployed,
+          tonBalance:
+            tonBalance.toString(),
+          requiredReserve:
+            MIN_SENDER_TON_BALANCE.toString()
+        }
+      )
+    );
+
     if (
       tonBalance <
       MIN_SENDER_TON_BALANCE
     ) {
       throw new Error(
-        `Insufficient TON balance. Required reserve: ` +
-        `${MIN_SENDER_TON_BALANCE.toString()} nanotons. ` +
+        `Insufficient TON balance. ` +
+        `Required reserve: ${MIN_SENDER_TON_BALANCE.toString()} nanotons. ` +
         `Available: ${tonBalance.toString()}`
       );
     }
@@ -1865,7 +2843,9 @@ async function sendPTN(env, order) {
     const master =
       client.open(
         JettonMaster.create(
-          Address.parse(PTN_MASTER)
+          Address.parse(
+            PTN_MASTER
+          )
         )
       );
 
@@ -1885,8 +2865,13 @@ async function sendPTN(env, order) {
       await senderJettonWallet.getBalance();
 
     const amount =
-      BigInt(order.ptn_amount) *
-      10n ** BigInt(PTN_DECIMALS);
+      BigInt(
+        order.ptn_amount
+      ) *
+      10n **
+        BigInt(
+          PTN_DECIMALS
+        );
 
     if (
       amount <= 0n
@@ -1895,6 +2880,26 @@ async function sendPTN(env, order) {
         "Invalid PTN payout amount"
       );
     }
+
+    console.log(
+      `PTN BALANCE CHECK ORDER ${order.id}:`,
+      JSON.stringify(
+        {
+          senderJettonAddress:
+            senderJettonAddress.toString(
+              {
+                bounceable: false,
+                testOnly: false,
+                urlSafe: true
+              }
+            ),
+          required:
+            amount.toString(),
+          available:
+            senderJettonBalance.toString()
+        }
+      )
+    );
 
     if (
       senderJettonBalance <
@@ -1912,6 +2917,13 @@ async function sendPTN(env, order) {
         order.payment_address
       );
 
+    /*
+     * Use the order ID as query_id.
+     *
+     * This makes the payout searchable and allows the bot
+     * to recognize an already-created transfer before sending
+     * another one.
+     */
     const queryId =
       BigInt(order.id);
 
@@ -1926,9 +2938,15 @@ async function sendPTN(env, order) {
       );
 
     if (existingBefore) {
+      console.log(
+        `EXISTING PTN PAYOUT FOUND ORDER ${order.id}:`,
+        existingBefore.hash
+      );
+
       return {
         success: true,
-        hash: existingBefore.hash
+        hash:
+          existingBefore.hash
       };
     }
 
@@ -1942,9 +2960,15 @@ async function sendPTN(env, order) {
           queryId,
           64
         )
-        .storeCoins(amount)
-        .storeAddress(destination)
-        .storeAddress(senderWallet.address)
+        .storeCoins(
+          amount
+        )
+        .storeAddress(
+          destination
+        )
+        .storeAddress(
+          senderWallet.address
+        )
         .storeBit(0)
         .storeCoins(0n)
         .storeBit(0)
@@ -1952,6 +2976,27 @@ async function sendPTN(env, order) {
 
     const seqno =
       await wallet.getSeqno();
+
+    console.log(
+      `PTN TRANSFER SUBMIT ORDER ${order.id}:`,
+      JSON.stringify(
+        {
+          seqno,
+          queryId:
+            queryId.toString(),
+          amount:
+            amount.toString(),
+          destination:
+            destination.toString(
+              {
+                bounceable: false,
+                testOnly: false,
+                urlSafe: true
+              }
+            )
+        }
+      )
+    );
 
     await wallet.sendTransfer({
       seqno,
@@ -1961,14 +3006,20 @@ async function sendPTN(env, order) {
         SendMode.PAY_GAS_SEPARATELY,
       messages: [
         internal({
-          to: senderJettonAddress,
-          value: PAYOUT_MESSAGE_TON,
+          to:
+            senderJettonAddress,
+          value:
+            PAYOUT_MESSAGE_TON,
           bounce: true,
           body
         })
       ]
     });
 
+    /*
+     * The sendTransfer call can return before the transaction is
+     * indexed by TON Center. Poll for a limited period.
+     */
     for (
       let attempt = 0;
       attempt < 12;
@@ -1987,12 +3038,27 @@ async function sendPTN(env, order) {
         );
 
       if (confirmed) {
+        console.log(
+          `PTN PAYOUT CONFIRMED ORDER ${order.id}:`,
+          confirmed.hash
+        );
+
         return {
           success: true,
-          hash: confirmed.hash
+          hash:
+            confirmed.hash
         };
       }
     }
+
+    /*
+     * No confirmation yet does NOT mean the transaction failed.
+     * Keep the order in payout_processing so the next cron run
+     * does not immediately submit a second transaction.
+     */
+    console.warn(
+      `PTN PAYOUT PENDING CONFIRMATION ORDER ${order.id}`
+    );
 
     return {
       success: false,
@@ -2001,16 +3067,19 @@ async function sendPTN(env, order) {
   } catch (error) {
     console.error(
       `PTN PAYOUT ERROR ORDER ${order.id}:`,
-      error
+      JSON.stringify(
+        describeError(error)
+      )
     );
 
     return {
       success: false,
-      error: String(
-        error?.message ||
-        error ||
-        "Unknown payout error"
-      )
+      error:
+        String(
+          error?.message ||
+            error ||
+            "Unknown payout error"
+        )
     };
   }
 }
@@ -2023,9 +3092,11 @@ async function findExistingPayout(
   queryId,
   expectedAmount
 ) {
-  const apiKey = String(
-    env.TONCENTER_API_KEY || ""
-  ).trim();
+  const apiKey =
+    String(
+      env.TONCENTER_API_KEY ||
+        ""
+    ).trim();
 
   if (!apiKey) {
     console.error(
@@ -2037,7 +3108,9 @@ async function findExistingPayout(
 
   try {
     const owner =
-      canonicalAddress(ownerAddress);
+      canonicalAddress(
+        ownerAddress
+      );
 
     const sourceJettonWallet =
       canonicalAddress(
@@ -2045,11 +3118,14 @@ async function findExistingPayout(
       );
 
     const destinationAddress =
-      canonicalAddress(destination);
+      canonicalAddress(
+        destination
+      );
 
     for (
       let page = 0;
-      page < PAYOUT_SEARCH_PAGES;
+      page <
+        PAYOUT_SEARCH_PAGES;
       page++
     ) {
       const params =
@@ -2077,7 +3153,9 @@ async function findExistingPayout(
 
       params.set(
         "offset",
-        String(page * 1000)
+        String(
+          page * 1000
+        )
       );
 
       params.set(
@@ -2090,11 +3168,15 @@ async function findExistingPayout(
         params.toString();
 
       const response =
-        await fetch(url, {
-          headers: {
-            "X-API-Key": apiKey
+        await fetch(
+          url,
+          {
+            headers: {
+              "X-API-Key":
+                apiKey
+            }
           }
-        });
+        );
 
       if (!response.ok) {
         const text =
@@ -2123,14 +3205,17 @@ async function findExistingPayout(
         break;
       }
 
-      for (const transfer of transfers) {
+      for (
+        const transfer of transfers
+      ) {
         let transferQueryId;
 
         try {
           transferQueryId =
             BigInt(
               String(
-                transfer?.query_id ?? ""
+                transfer?.query_id ??
+                  ""
               )
             );
         } catch {
@@ -2180,7 +3265,8 @@ async function findExistingPayout(
 
         if (
           String(
-            transfer?.amount ?? ""
+            transfer?.amount ??
+              ""
           ) !==
           expectedAmount.toString()
         ) {
@@ -2203,7 +3289,8 @@ async function findExistingPayout(
       }
 
       if (
-        transfers.length < 1000
+        transfers.length <
+        1000
       ) {
         break;
       }
@@ -2211,7 +3298,7 @@ async function findExistingPayout(
   } catch (error) {
     console.error(
       "PAYOUT SEARCH EXCEPTION:",
-      error
+      describeError(error)
     );
   }
 
@@ -2219,7 +3306,7 @@ async function findExistingPayout(
 }
 
 /* -------------------------------------------------------------------------- */
-/* Support                                                                   */
+/* Support                                                                    */
 /* -------------------------------------------------------------------------- */
 
 async function handleSupportMessage(
@@ -2228,7 +3315,10 @@ async function handleSupportMessage(
   telegramUser,
   text
 ) {
-  await clearUserState(env, telegramId);
+  await clearUserState(
+    env,
+    telegramId
+  );
 
   const existing =
     await env.DB.prepare(
@@ -2245,7 +3335,8 @@ async function handleSupportMessage(
   let ticketId;
 
   if (existing) {
-    ticketId = Number(existing.id);
+    ticketId =
+      Number(existing.id);
   } else {
     const inserted =
       await env.DB.prepare(
@@ -2300,7 +3391,9 @@ async function handleSupportMessage(
       `User: ${username}\n` +
       `Telegram ID: ${telegramId}\n\n` +
       text,
-    ticketKeyboard(ticketId)
+    ticketKeyboard(
+      ticketId
+    )
   );
 }
 
@@ -2360,7 +3453,8 @@ async function handleAdminReplyText(
 
   await env.DB.prepare(
     `UPDATE support_tickets
-     SET status='open', updated_at=?
+     SET status='open',
+         updated_at=?
      WHERE id=?`
   )
     .bind(
@@ -2398,7 +3492,11 @@ async function showAdminSupport(
       `SELECT *
        FROM support_tickets
        ORDER BY
-         CASE WHEN status='open' THEN 0 ELSE 1 END,
+         CASE
+           WHEN status='open'
+           THEN 0
+           ELSE 1
+         END,
          updated_at DESC
        LIMIT 20`
     )
@@ -2413,7 +3511,9 @@ async function showAdminSupport(
   if (!tickets.length) {
     text += "No tickets.";
   } else {
-    for (const ticket of tickets) {
+    for (
+      const ticket of tickets
+    ) {
       text +=
         `#${ticket.id} | ` +
         `User ${ticket.telegram_id} | ` +
@@ -2423,18 +3523,21 @@ async function showAdminSupport(
 
   const keyboard = {
     inline_keyboard: [
-      ...tickets.map((ticket) => [
-        {
-          text:
-            `Ticket #${ticket.id} (${ticket.status})`,
-          callback_data:
-            `ticket:${ticket.id}`
-        }
-      ]),
+      ...tickets.map(
+        (ticket) => [
+          {
+            text:
+              `Ticket #${ticket.id} (${ticket.status})`,
+            callback_data:
+              `ticket:${ticket.id}`
+          }
+        ]
+      ),
       [
         {
           text: "Admin Panel",
-          callback_data: "admin"
+          callback_data:
+            "admin"
         }
       ]
     ]
@@ -2496,7 +3599,9 @@ async function showTicket(
     `User: ${ticket.telegram_id}\n` +
     `Status: ${ticket.status}\n\n`;
 
-  for (const item of messages) {
+  for (
+    const item of messages
+  ) {
     text +=
       `[${item.sender_role}] ${item.message_text}\n\n`;
   }
@@ -2506,7 +3611,9 @@ async function showTicket(
     adminTelegramId,
     messageId,
     text,
-    ticketKeyboard(ticketId)
+    ticketKeyboard(
+      ticketId
+    )
   );
 }
 
@@ -2545,7 +3652,8 @@ async function sendQuickReply(
 
   await env.DB.prepare(
     `UPDATE support_tickets
-     SET status='open', updated_at=?
+     SET status='open',
+         updated_at=?
      WHERE id=?`
   )
     .bind(
@@ -2564,7 +3672,9 @@ async function sendQuickReply(
     env,
     adminTelegramId,
     `Quick reply sent to ticket #${ticketId}.`,
-    ticketKeyboard(ticketId)
+    ticketKeyboard(
+      ticketId
+    )
   );
 }
 
@@ -2588,7 +3698,8 @@ async function showAdminDashboard(
   const counts = {};
 
   for (
-    const row of result.results || []
+    const row of result.results ||
+      []
   ) {
     counts[row.status] =
       Number(row.count);
@@ -2598,14 +3709,16 @@ async function showAdminDashboard(
     await env.DB.prepare(
       `SELECT COUNT(*) AS count
        FROM users`
-    ).first();
+    )
+      .first();
 
   const openTickets =
     await env.DB.prepare(
       `SELECT COUNT(*) AS count
        FROM support_tickets
        WHERE status='open'`
-    ).first();
+    )
+      .first();
 
   const text =
     `Dashboard\n\n` +
@@ -2639,7 +3752,8 @@ async function showAdminOrders(
        FROM orders
        ORDER BY id DESC
        LIMIT 25`
-    ).all();
+    )
+      .all();
 
   const orders =
     result.results || [];
@@ -2650,7 +3764,9 @@ async function showAdminOrders(
   if (!orders.length) {
     text += "No orders.";
   } else {
-    for (const order of orders) {
+    for (
+      const order of orders
+    ) {
       text +=
         `#${order.id} | ` +
         `${order.gram_amount || "-"} GRAM | ` +
@@ -2662,18 +3778,21 @@ async function showAdminOrders(
 
   const keyboard = {
     inline_keyboard: [
-      ...orders.slice(0, 15).map((order) => [
-        {
-          text:
-            `#${order.id} ${formatStatus(order.status)}`,
-          callback_data:
-            `admin_order:${order.id}`
-        }
-      ]),
+      ...orders.slice(0, 15).map(
+        (order) => [
+          {
+            text:
+              `#${order.id} ${formatStatus(order.status)}`,
+            callback_data:
+              `admin_order:${order.id}`
+          }
+        ]
+      ),
       [
         {
           text: "Admin Panel",
-          callback_data: "admin"
+          callback_data:
+            "admin"
         }
       ]
     ]
@@ -2697,10 +3816,15 @@ async function showAdminPending(
     await env.DB.prepare(
       `SELECT *
        FROM orders
-       WHERE status IN ('pending','payment_verified','payout_processing')
+       WHERE status IN (
+         'pending',
+         'payment_verified',
+         'payout_processing'
+       )
        ORDER BY id ASC
        LIMIT 25`
-    ).all();
+    )
+      .all();
 
   const orders =
     result.results || [];
@@ -2709,9 +3833,12 @@ async function showAdminPending(
     "Pending Orders\n\n";
 
   if (!orders.length) {
-    text += "No pending orders.";
+    text +=
+      "No pending orders.";
   } else {
-    for (const order of orders) {
+    for (
+      const order of orders
+    ) {
       text +=
         `#${order.id} | ` +
         `${order.gram_amount} GRAM | ` +
@@ -2722,18 +3849,21 @@ async function showAdminPending(
 
   const keyboard = {
     inline_keyboard: [
-      ...orders.map((order) => [
-        {
-          text:
-            `Order #${order.id}`,
-          callback_data:
-            `admin_order:${order.id}`
-        }
-      ]),
+      ...orders.map(
+        (order) => [
+          {
+            text:
+              `Order #${order.id}`,
+            callback_data:
+              `admin_order:${order.id}`
+          }
+        ]
+      ),
       [
         {
           text: "Admin Panel",
-          callback_data: "admin"
+          callback_data:
+            "admin"
         }
       ]
     ]
@@ -2759,7 +3889,8 @@ async function showAdminUsers(
        FROM users
        ORDER BY id DESC
        LIMIT 25`
-    ).all();
+    )
+      .all();
 
   const users =
     result.results || [];
@@ -2770,7 +3901,9 @@ async function showAdminUsers(
   if (!users.length) {
     text += "No users.";
   } else {
-    for (const user of users) {
+    for (
+      const user of users
+    ) {
       text +=
         `${user.telegram_id} | ` +
         `${user.username || user.first_name || "-"} | ` +
@@ -2780,19 +3913,22 @@ async function showAdminUsers(
 
   const keyboard = {
     inline_keyboard: [
-      ...users.map((user) => [
-        {
-          text:
-            `${user.username || user.telegram_id} ` +
-            `${user.is_blocked ? "Unblock" : "Block"}`,
-          callback_data:
-            `${user.is_blocked ? "unblock" : "block"}:${user.telegram_id}`
-        }
-      ]),
+      ...users.map(
+        (user) => [
+          {
+            text:
+              `${user.username || user.telegram_id} ` +
+              `${user.is_blocked ? "Unblock" : "Block"}`,
+            callback_data:
+              `${user.is_blocked ? "unblock" : "block"}:${user.telegram_id}`
+          }
+        ]
+      ),
       [
         {
           text: "Admin Panel",
-          callback_data: "admin"
+          callback_data:
+            "admin"
         }
       ]
     ]
@@ -2845,9 +3981,12 @@ async function showAdminSuspicious(
     "Suspicious / Stalled Orders\n\n";
 
   if (!orders.length) {
-    text += "No suspicious or stalled orders.";
+    text +=
+      "No suspicious or stalled orders.";
   } else {
-    for (const order of orders) {
+    for (
+      const order of orders
+    ) {
       text +=
         `#${order.id} | ` +
         `${order.telegram_id} | ` +
@@ -2858,18 +3997,21 @@ async function showAdminSuspicious(
 
   const keyboard = {
     inline_keyboard: [
-      ...orders.map((order) => [
-        {
-          text:
-            `Order #${order.id}`,
-          callback_data:
-            `admin_order:${order.id}`
-        }
-      ]),
+      ...orders.map(
+        (order) => [
+          {
+            text:
+              `Order #${order.id}`,
+            callback_data:
+              `admin_order:${order.id}`
+          }
+        ]
+      ),
       [
         {
           text: "Admin Panel",
-          callback_data: "admin"
+          callback_data:
+            "admin"
         }
       ]
     ]
@@ -2895,13 +4037,18 @@ async function showAdminRevenue(
        FROM orders
        WHERE status='payout_sent'
        LIMIT 10000`
-    ).all();
+    )
+      .all();
 
-  let totalGramMicro = 0n;
-  let totalPtn = 0n;
+  let totalGramMicro =
+    0n;
+
+  let totalPtn =
+    0n;
 
   for (
-    const row of result.results || []
+    const row of
+      result.results || []
   ) {
     try {
       totalGramMicro +=
@@ -2911,7 +4058,8 @@ async function showAdminRevenue(
 
       totalPtn +=
         BigInt(
-          row.ptn_amount || "0"
+          row.ptn_amount ||
+            "0"
         );
     } catch {
       continue;
@@ -3013,28 +4161,34 @@ async function showAdminOrder(
 
   const keyboard = {
     inline_keyboard: [
-      ...(order.status === "payment_verified" ||
-      order.status === "payout_processing"
-        ? [
-            [
-              {
-                text: "Retry Payout",
-                callback_data:
-                  `retry_order:${order.id}`
-              }
+      ...(
+        order.status ===
+          "payment_verified" ||
+        order.status ===
+          "payout_processing"
+          ? [
+              [
+                {
+                  text: "Retry Payout",
+                  callback_data:
+                    `retry_order:${order.id}`
+                }
+              ]
             ]
-          ]
-        : []),
+          : []
+      ),
       [
         {
           text: "Pending",
-          callback_data: "admin_pending"
+          callback_data:
+            "admin_pending"
         }
       ],
       [
         {
           text: "Admin Panel",
-          callback_data: "admin"
+          callback_data:
+            "admin"
         }
       ]
     ]
@@ -3053,7 +4207,9 @@ async function showAdminOrder(
 /* Database                                                                   */
 /* -------------------------------------------------------------------------- */
 
-async function ensureSchema(env) {
+async function ensureSchema(
+  env
+) {
   await env.DB.prepare(
     `CREATE TABLE IF NOT EXISTS users (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -3260,7 +4416,8 @@ async function ensureSchema(env) {
     "INTEGER"
   );
 
-  const current = now();
+  const current =
+    now();
 
   await env.DB.prepare(
     `UPDATE users
@@ -3269,7 +4426,10 @@ async function ensureSchema(env) {
      WHERE created_at IS NULL
         OR updated_at IS NULL`
   )
-    .bind(current, current)
+    .bind(
+      current,
+      current
+    )
     .run();
 
   await env.DB.prepare(
@@ -3279,7 +4439,10 @@ async function ensureSchema(env) {
      WHERE created_at IS NULL
         OR updated_at IS NULL`
   )
-    .bind(current, current)
+    .bind(
+      current,
+      current
+    )
     .run();
 
   await env.DB.prepare(
@@ -3323,14 +4486,16 @@ async function ensureColumn(
   const result =
     await env.DB.prepare(
       `PRAGMA table_info(${table})`
-    ).all();
+    )
+      .all();
 
   const exists =
-    (result.results || []).some(
-      (row) =>
-        String(row.name) ===
-        String(column)
-    );
+    (result.results || [])
+      .some(
+        (row) =>
+          String(row.name) ===
+          String(column)
+      );
 
   if (exists) {
     return;
@@ -3346,7 +4511,10 @@ async function ensureColumn(
 /* User database helpers                                                      */
 /* -------------------------------------------------------------------------- */
 
-async function upsertUser(env, from) {
+async function upsertUser(
+  env,
+  from
+) {
   const telegramId =
     String(from.id);
 
@@ -3381,14 +4549,19 @@ async function upsertUser(env, from) {
     .run();
 }
 
-async function getUser(env, telegramId) {
+async function getUser(
+  env,
+  telegramId
+) {
   return env.DB.prepare(
     `SELECT *
      FROM users
      WHERE telegram_id=?
      LIMIT 1`
   )
-    .bind(String(telegramId))
+    .bind(
+      String(telegramId)
+    )
     .first();
 }
 
@@ -3501,7 +4674,9 @@ async function getOrderById(
      WHERE id=?
      LIMIT 1`
   )
-    .bind(Number(orderId))
+    .bind(
+      Number(orderId)
+    )
     .first();
 }
 
@@ -3509,7 +4684,9 @@ async function getOrderById(
 /* TON parsing and formatting                                                 */
 /* -------------------------------------------------------------------------- */
 
-function parseGramAmount(value) {
+function parseGramAmount(
+  value
+) {
   let text =
     String(value ?? "")
       .trim()
@@ -3522,7 +4699,11 @@ function parseGramAmount(value) {
     );
   }
 
-  if (!/^\d+(\.\d+)?$/.test(text)) {
+  if (
+    !/^\d+(\.\d+)?$/.test(
+      text
+    )
+  ) {
     throw new Error(
       "Invalid GRAM amount. Use numbers only, for example 10 or 10.25."
     );
@@ -3537,20 +4718,27 @@ function parseGramAmount(value) {
   const decimals =
     parts[1] || "";
 
-  if (decimals.length > 6) {
+  if (
+    decimals.length >
+    6
+  ) {
     throw new Error(
       "GRAM supports a maximum of 6 decimal places."
     );
   }
 
   const padded =
-    decimals
-      .padEnd(6, "0");
+    decimals.padEnd(
+      6,
+      "0"
+    );
 
   const micro =
     BigInt(whole) *
       1000000n +
-    BigInt(padded || "0");
+    BigInt(
+      padded || "0"
+    );
 
   if (
     micro <
@@ -3573,13 +4761,21 @@ function parseGramAmount(value) {
   return micro;
 }
 
-function gramToMicro(value) {
-  return parseGramAmount(value);
+function gramToMicro(
+  value
+) {
+  return parseGramAmount(
+    value
+  );
 }
 
-function gramToNano(value) {
+function gramToNano(
+  value
+) {
   const micro =
-    gramToMicro(value);
+    gramToMicro(
+      value
+    );
 
   return (
     micro * 1000n
@@ -3616,8 +4812,14 @@ function formatGramMicro(
   let fractionText =
     fraction
       .toString()
-      .padStart(6, "0")
-      .replace(/0+$/, "");
+      .padStart(
+        6,
+        "0"
+      )
+      .replace(
+        /0+$/,
+        ""
+      );
 
   if (!fractionText) {
     return (
@@ -3642,9 +4844,13 @@ function formatGramMicro(
     fractionText;
 }
 
-function formatInteger(value) {
+function formatInteger(
+  value
+) {
   const text =
-    String(value ?? "0");
+    String(
+      value ?? "0"
+    );
 
   return text.replace(
     /\B(?=(\d{3})+(?!\d))/g,
@@ -3668,11 +4874,13 @@ function normalizeUserAddress(
     );
   }
 
-  return address.toString({
-    bounceable: false,
-    testOnly: false,
-    urlSafe: true
-  });
+  return address.toString(
+    {
+      bounceable: false,
+      testOnly: false,
+      urlSafe: true
+    }
+  );
 }
 
 function canonicalAddress(
@@ -3680,11 +4888,13 @@ function canonicalAddress(
 ) {
   return Address.parse(
     String(value)
-  ).toString({
-    bounceable: false,
-    testOnly: false,
-    urlSafe: true
-  });
+  ).toString(
+    {
+      bounceable: false,
+      testOnly: false,
+      urlSafe: true
+    }
+  );
 }
 
 function sameAddress(
@@ -3739,7 +4949,9 @@ function formatStatus(
 
   return (
     map[status] ||
-    String(status || "-")
+    String(
+      status || "-"
+    )
   );
 }
 
@@ -3752,7 +4964,8 @@ function formatTime(
 
   try {
     return new Date(
-      Number(timestamp) * 1000
+      Number(timestamp) *
+        1000
     ).toISOString();
   } catch {
     return "-";
@@ -3767,7 +4980,11 @@ async function createUniquePaymentComment(
   env,
   orderId
 ) {
-  for (let attempt = 0; attempt < 5; attempt++) {
+  for (
+    let attempt = 0;
+    attempt < 5;
+    attempt++
+  ) {
     const bytes =
       new Uint8Array(8);
 
@@ -3777,10 +4994,15 @@ async function createUniquePaymentComment(
 
     let suffix = "";
 
-    for (const byte of bytes) {
+    for (
+      const byte of bytes
+    ) {
       suffix += byte
         .toString(16)
-        .padStart(2, "0");
+        .padStart(
+          2,
+          "0"
+        );
     }
 
     const comment =
@@ -3819,7 +5041,10 @@ function now() {
 function sleep(ms) {
   return new Promise(
     (resolve) =>
-      setTimeout(resolve, ms)
+      setTimeout(
+        resolve,
+        ms
+      )
   );
 }
 
@@ -3830,6 +5055,27 @@ function isAdmin(
     String(telegramId) ===
     ADMIN_TELEGRAM_ID
   );
+}
+
+/*
+ * Safe error serializer.
+ *
+ * Never put secrets, mnemonic words, or private keys into logs.
+ */
+function describeError(
+  error
+) {
+  return {
+    name:
+      error?.name ||
+      "UnknownError",
+    message:
+      error?.message ||
+      String(error),
+    stack:
+      error?.stack ||
+      null
+  };
 }
 
 function normalizeBase64(
