@@ -1,1295 +1,353 @@
 import { Buffer } from "buffer";
-
-import {
-  Address,
-  beginCell,
-  internal,
-  SendMode,
-  toNano
-} from "@ton/core";
-
-import {
-  TonClient,
-  WalletContractV4,
-  WalletContractV5R1,
-  JettonMaster
-} from "@ton/ton";
+import { Address } from "@ton/core";
+import { TonClient, WalletContractV4, WalletContractV5R1 } from "@ton/ton";
 
 globalThis.Buffer = Buffer;
 
-/* =========================================================
-   PAYTON - MANUAL PTN PAYMENT ONLY
-========================================================= */
-
 const ADMIN_TELEGRAM_ID = "113074274";
 
-const PTN_MASTER =
-  "EQAZ_Rw9M91opByfYz1edG0TbeAKP72WcdccprkZvbvPVkAZ";
-
 const PTN_SENDER_WALLET =
-  "UQD9eW663lS-7SeGVyYK_cQlKBSjzWSbxaBkgUTigTjZ9Hh6";
-
-const PTN_DECIMALS = 9;
-
-const MIN_GAS_BALANCE =
-  toNano("0.20");
+  "UQD9e663lS-7SeGVyYK_cQlKBSjzWSbxaBkgUTigTjZ9Hh6";
 
 const TONCENTER_ENDPOINT =
   "https://toncenter.com/api/v2/jsonRPC";
 
-
-/* =========================================================
-   MENU
-========================================================= */
-
-const MENU = {
-  inline_keyboard: [
-    [
-      {
-        text: "💸 Manual PTN Payment",
-        callback_data: "manual_ptn"
-      }
-    ]
-  ]
-};
-
-const CANCEL_MENU = {
-  inline_keyboard: [
-    [
-      {
-        text: "❌ Cancel",
-        callback_data: "cancel"
-      }
-    ]
-  ]
-};
-
-
-/* =========================================================
-   TELEGRAM API
-========================================================= */
-
-async function telegram(
-  env,
-  method,
-  body
-) {
-  if (!env.BOT_TOKEN) {
-    throw new Error(
-      "BOT_TOKEN is missing."
-    );
-  }
-
-  const response =
-    await fetch(
-      `https://api.telegram.org/bot${env.BOT_TOKEN}/${method}`,
-      {
-        method: "POST",
-        headers: {
-          "content-type":
-            "application/json"
-        },
-        body:
-          JSON.stringify(body)
-      }
-    );
-
-  const data =
-    await response.json()
-      .catch(() => null);
-
-  if (
-    !response.ok ||
-    data?.ok === false
-  ) {
-    throw new Error(
-      data?.description ||
-      `Telegram ${method} failed.`
-    );
-  }
-
-  return data;
+function json(data, status = 200) {
+  return new Response(JSON.stringify(data, null, 2), {
+    status,
+    headers: {
+      "content-type": "application/json; charset=utf-8"
+    }
+  });
 }
 
-
-/* =========================================================
-   DATABASE STATE
-========================================================= */
-
-async function ensureStateTable(
-  env
-) {
-  await env.DB.prepare(`
-    CREATE TABLE IF NOT EXISTS manual_ptn_state (
-      telegram_id TEXT PRIMARY KEY,
-      mode TEXT,
-      destination TEXT,
-      updated_at TEXT DEFAULT CURRENT_TIMESTAMP
-    )
-  `).run();
+function normalizeMnemonic(raw) {
+  return String(raw || "")
+    .trim()
+    .replace(/\s+/g, " ")
+    .split(" ")
+    .filter(Boolean);
 }
 
-
-async function setState(
-  env,
-  mode,
-  destination = null
-) {
-  await ensureStateTable(env);
-
-  await env.DB.prepare(`
-    INSERT INTO manual_ptn_state
-      (
-        telegram_id,
-        mode,
-        destination,
-        updated_at
-      )
-    VALUES (?, ?, ?, CURRENT_TIMESTAMP)
-
-    ON CONFLICT(telegram_id)
-    DO UPDATE SET
-      mode=excluded.mode,
-      destination=excluded.destination,
-      updated_at=CURRENT_TIMESTAMP
-  `)
-    .bind(
-      ADMIN_TELEGRAM_ID,
-      mode,
-      destination
-    )
-    .run();
-}
-
-
-async function getState(
-  env
-) {
-  await ensureStateTable(env);
-
-  return await env.DB.prepare(`
-    SELECT
-      mode,
-      destination
-    FROM manual_ptn_state
-    WHERE telegram_id=?
-    LIMIT 1
-  `)
-    .bind(
-      ADMIN_TELEGRAM_ID
-    )
-    .first();
-}
-
-
-async function clearState(
-  env
-) {
-  await ensureStateTable(env);
-
-  await env.DB.prepare(`
-    DELETE FROM manual_ptn_state
-    WHERE telegram_id=?
-  `)
-    .bind(
-      ADMIN_TELEGRAM_ID
-    )
-    .run();
-}
-
-
-/* =========================================================
-   PTN AMOUNT PARSER
-========================================================= */
-
-function parsePtnAmount(
-  value
-) {
-  const input =
-    String(value || "")
-      .trim();
-
-  if (
-    !/^\d+(?:\.\d{1,9})?$/.test(
-      input
-    )
-  ) {
-    throw new Error(
-      "Invalid PTN amount. Use a positive number with up to 9 decimal places."
-    );
-  }
-
-  const parts =
-    input.split(".");
-
-  const whole =
-    BigInt(parts[0]);
-
-  const fraction =
-    (parts[1] || "")
-      .padEnd(
-        PTN_DECIMALS,
-        "0"
-      );
-
-  const amount =
-    whole *
-      (10n **
-        BigInt(PTN_DECIMALS)) +
-    BigInt(fraction);
-
-  if (amount <= 0n) {
-    throw new Error(
-      "PTN amount must be greater than zero."
-    );
-  }
-
-  return {
-    units: amount,
-    display: input
-  };
-}
-
-
-/* =========================================================
-   DESTINATION ADDRESS
-========================================================= */
-
-function parseDestination(
-  value
-) {
-  const input =
-    String(value || "")
-      .trim();
-
-  if (!input) {
-    throw new Error(
-      "Wallet address is required."
-    );
-  }
-
-  /*
-    IMPORTANT:
-
-    The destination is ONLY parsed as a TON address.
-
-    We do NOT determine whether the destination
-    wallet is V4, V5, V3, or anything else.
-
-    It is simply the Jetton recipient address.
-  */
-
-  return Address.parse(
-    input
-  );
-}
-
-
-/* =========================================================
-   DERIVE TON KEY FROM MNEMONIC
-========================================================= */
-
-async function getKeyPair(
-  env
-) {
-  const mnemonic =
-    String(
-      env.PTN_MNEMONIC || ""
-    ).trim();
-
-  if (!mnemonic) {
-    throw new Error(
-      "PTN_MNEMONIC is missing from Cloudflare Secrets."
-    );
-  }
-
-  const words =
-    mnemonic.split(/\s+/);
-
-  if (
-    words.length !== 12 &&
-    words.length !== 24
-  ) {
-    throw new Error(
-      `PTN_MNEMONIC must contain 12 or 24 words. Found ${words.length}.`
-    );
-  }
-
-  /*
-    @ton/crypto uses browser-style crypto
-    internally for TON mnemonic derivation.
-
-    In Cloudflare Workers we expose the Worker
-    global as "window" before dynamically loading
-    the module.
-  */
-
-  if (
-    typeof globalThis.window ===
-    "undefined"
-  ) {
-    globalThis.window =
-      globalThis;
-  }
-
-  const cryptoModule =
-    await import(
-      "@ton/crypto"
-    );
-
-  const keyPair =
-    await cryptoModule.mnemonicToPrivateKey(
-      words
-    );
-
-  return keyPair;
-}
-
-
-/* =========================================================
-   FIND THE ACTUAL SENDER WALLET
-========================================================= */
-
-function getSenderWallet(
-  keyPair
-) {
-  /*
-    First check V4R2.
-
-    TON official documentation:
-    default V4R2 wallet_id =
-    0x29a9a317
-  */
-
-  const v4 =
-    WalletContractV4.create({
-      workchain: 0,
-      publicKey:
-        keyPair.publicKey,
-      walletId:
-        0x29a9a317
-    });
-
-  if (
-    v4.address.toString() ===
-    PTN_SENDER_WALLET
-  ) {
-    return {
-      type: "V4R2",
-      wallet: v4
-    };
-  }
-
-
-  /*
-    Then check V5R1 mainnet.
-
-    Mainnet networkGlobalId = -239
-  */
-
-  const v5 =
-    WalletContractV5R1.create({
-      workchain: 0,
-      publicKey:
-        keyPair.publicKey,
-      walletId: {
-        networkGlobalId:
-          -239
-      }
-    });
-
-  if (
-    v5.address.toString() ===
-    PTN_SENDER_WALLET
-  ) {
-    return {
-      type: "V5R1",
-      wallet: v5
-    };
-  }
-
-
-  /*
-    Never send if the mnemonic does not
-    produce the configured sender address.
-  */
-
-  throw new Error(
-    "The configured mnemonic does not match the PTN sender wallet in V4R2 or V5R1. No transaction was sent."
-  );
-}
-
-
-/* =========================================================
-   SEND MANUAL PTN
-========================================================= */
-
-async function sendManualPTN(
-  env,
-  destination,
-  amount
-) {
+function sameAddress(a, b) {
   try {
+    return Address.parse(a)
+      .equals(Address.parse(b));
+  } catch {
+    return false;
+  }
+}
 
-    /* -----------------------------------------
-       KEY
-    ----------------------------------------- */
+async function telegram(env, method, body) {
+  const url =
+    `https://api.telegram.org/bot${env.BOT_TOKEN}/${method}`;
 
-    const keyPair =
-      await getKeyPair(env);
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json"
+    },
+    body: JSON.stringify(body)
+  });
 
+  return response.json();
+}
 
-    /* -----------------------------------------
-       FIND REAL SENDER VERSION
-    ----------------------------------------- */
+async function sendMessage(env, chatId, text) {
+  return telegram(env, "sendMessage", {
+    chat_id: chatId,
+    text
+  });
+}
 
-    const sender =
-      getSenderWallet(
-        keyPair
-      );
+async function runDiagnostic(env) {
+  const result = {
+    test: "PTN sender wallet diagnostic",
+    transaction_sent: false,
+    configured_sender: PTN_SENDER_WALLET
+  };
 
-    const senderWallet =
-      sender.wallet;
+  if (!env.PTN_MNEMONIC) {
+    result.error = "PTN_MNEMONIC secret is missing.";
+    return result;
+  }
 
+  /*
+   * IMPORTANT:
+   * We intentionally do not print the mnemonic,
+   * private key, or public key.
+   */
+  const words = normalizeMnemonic(env.PTN_MNEMONIC);
 
-    console.log(
-      `PTN SENDER VERSION: ${sender.type}`
-    );
+  result.mnemonic_word_count = words.length;
 
-    console.log(
-      `PTN SENDER ADDRESS: ${senderWallet.address.toString()}`
-    );
+  if (words.length !== 12 && words.length !== 24) {
+    result.mnemonic_status =
+      "INVALID_WORD_COUNT";
+    return result;
+  }
 
+  let cryptoModule;
 
-    /* -----------------------------------------
-       TON CLIENT
-    ----------------------------------------- */
-
-    const client =
-      new TonClient({
-        endpoint:
-          TONCENTER_ENDPOINT,
-        apiKey:
-          env.TONCENTER_API_KEY
-      });
-
-
-    /* -----------------------------------------
-       DEPLOYMENT
-    ----------------------------------------- */
-
-    const deployed =
-      await client.isContractDeployed(
-        senderWallet.address
-      );
-
-    if (!deployed) {
-      throw new Error(
-        "The PTN sender wallet is not deployed."
-      );
+  try {
+    /*
+     * Cloudflare Workers compatibility.
+     * The previous Worker had a runtime problem around
+     * @ton/crypto expecting window.
+     */
+    if (typeof globalThis.window === "undefined") {
+      globalThis.window = globalThis;
     }
 
+    cryptoModule = await import("@ton/crypto");
+  } catch (error) {
+    result.mnemonic_status = "CRYPTO_IMPORT_FAILED";
+    result.error = String(error?.message || error);
+    return result;
+  }
 
-    /* -----------------------------------------
-       NATIVE GRAM BALANCE
-    ----------------------------------------- */
+  let mnemonicValid = false;
 
-    const nativeBalance =
-      await client.getBalance(
-        senderWallet.address
-      );
-
-    if (
-      nativeBalance <
-      MIN_GAS_BALANCE
-    ) {
-      throw new Error(
-        "Insufficient native GRAM balance for network fees."
-      );
+  try {
+    if (typeof cryptoModule.mnemonicValidate === "function") {
+      mnemonicValid =
+        await cryptoModule.mnemonicValidate(words);
+    } else {
+      mnemonicValid = true;
+      result.mnemonic_validation =
+        "VALIDATION_FUNCTION_NOT_AVAILABLE";
     }
+  } catch (error) {
+    result.mnemonic_status = "MNEMONIC_VALIDATION_ERROR";
+    result.error = String(error?.message || error);
+    return result;
+  }
 
+  result.mnemonic_valid = mnemonicValid;
 
-    /* -----------------------------------------
-       PTN MASTER
-    ----------------------------------------- */
+  if (!mnemonicValid) {
+    result.mnemonic_status = "INVALID_TON_MNEMONIC";
+    return result;
+  }
 
-    const master =
-      client.open(
-        JettonMaster.create(
-          Address.parse(
-            PTN_MASTER
-          )
-        )
-      );
+  let keyPair;
 
+  try {
+    keyPair =
+      await cryptoModule.mnemonicToPrivateKey(words);
+  } catch (error) {
+    result.mnemonic_status = "KEY_DERIVATION_FAILED";
+    result.error = String(error?.message || error);
+    return result;
+  }
 
-    /* -----------------------------------------
-       SENDER PTN WALLET
-    ----------------------------------------- */
+  result.key_derivation = "SUCCESS";
 
-    const senderJettonWallet =
-      client.open(
-        await master.getWalletAddress(
-          senderWallet.address
-        )
-      );
+  /*
+   * We deliberately do NOT output the public key.
+   * We only use it internally to derive wallet addresses.
+   */
 
+  let v4Address = null;
+  let v5Address = null;
 
-    /* -----------------------------------------
-       PTN BALANCE
-    ----------------------------------------- */
-
-    const senderPtnBalance =
-      await senderJettonWallet
-        .getJettonBalance();
-
-    if (
-      senderPtnBalance <
-      amount
-    ) {
-      throw new Error(
-        "Insufficient PTN balance in the sender wallet."
-      );
-    }
-
-
-    /* -----------------------------------------
-       DESTINATION JETTON WALLET
-       
-       IMPORTANT:
-       The destination is only an Address.
-       No V4/V5 check is performed.
-    ----------------------------------------- */
-
-    const destinationJettonWallet =
-      await master.getWalletAddress(
-        destination
-      );
-
-
-    /* -----------------------------------------
-       UNIQUE QUERY ID
-    ----------------------------------------- */
-
-    const random =
-      crypto.getRandomValues(
-        new Uint32Array(1)
-      )[0];
-
-    const queryId =
-      (BigInt(Date.now()) <<
-        20n) |
-      BigInt(
-        random & 0xFFFFF
-      );
-
-
-    /* -----------------------------------------
-       JETTON TRANSFER BODY
-    ----------------------------------------- */
-
-    const body =
-      beginCell()
-
-        /*
-          transfer opcode
-        */
-        .storeUint(
-          0x0f8a7ea5,
-          32
-        )
-
-        /*
-          query_id
-        */
-        .storeUint(
-          queryId,
-          64
-        )
-
-        /*
-          PTN amount in smallest units
-        */
-        .storeCoins(
-          amount
-        )
-
-        /*
-          DESTINATION ONLY
-
-          No V4/V5 information here.
-        */
-        .storeAddress(
-          destination
-        )
-
-        /*
-          response destination
-        */
-        .storeAddress(
-          senderWallet.address
-        )
-
-        /*
-          no custom payload
-        */
-        .storeBit(0)
-
-        /*
-          forward TON amount
-        */
-        .storeCoins(
-          toNano("0.05")
-        )
-
-        /*
-          no forward payload
-        */
-        .storeBit(0)
-
-        .endCell();
-
-
-    /* -----------------------------------------
-       OPEN WALLET
-    ----------------------------------------- */
-
-    const wallet =
-      client.open(
-        senderWallet
-      );
-
-
-    /* -----------------------------------------
-       SEQNO
-    ----------------------------------------- */
-
-    const seqno =
-      await wallet.getSeqno();
-
-
-    /* -----------------------------------------
-       SEND
-    ----------------------------------------- */
-
-    await wallet.sendTransfer({
-      seqno,
-
-      secretKey:
-        keyPair.secretKey,
-
-      sendMode:
-        SendMode.PAY_GAS_SEPARATELY,
-
-      messages: [
-        internal({
-          to:
-            destinationJettonWallet,
-
-          value:
-            toNano("0.10"),
-
-          body
-        })
-      ]
+  try {
+    const v4 = WalletContractV4.create({
+      workchain: 0,
+      publicKey: keyPair.publicKey,
+      walletId: 0x29a9a317
     });
 
+    v4Address = v4.address.toString({
+      bounceable: true,
+      urlSafe: true
+    });
 
-    return {
-      success: true,
-
-      senderVersion:
-        sender.type,
-
-      senderAddress:
-        senderWallet.address.toString(),
-
-      destination:
-        destination.toString(),
-
-      queryId:
-        queryId.toString()
+    result.v4r2 = {
+      derived_address: v4Address,
+      matches_sender: sameAddress(
+        v4Address,
+        PTN_SENDER_WALLET
+      ),
+      wallet_id: "0x29a9a317"
     };
-
   } catch (error) {
-
-    console.error(
-      "MANUAL PTN SEND ERROR:",
-      error?.message ||
-      String(error)
-    );
-
-    return {
-      success: false,
-
-      error:
-        error?.message ||
-        String(error)
+    result.v4r2 = {
+      error: String(error?.message || error)
     };
   }
-}
 
-
-/* =========================================================
-   ADMIN MENU
-========================================================= */
-
-async function sendAdminMenu(
-  env,
-  chatId,
-  text =
-    "🛠 PAYTON Admin Panel"
-) {
-  await telegram(
-    env,
-    "sendMessage",
-    {
-      chat_id:
-        chatId,
-
-      text,
-
-      reply_markup:
-        MENU
-    }
-  );
-}
-
-
-/* =========================================================
-   CALLBACK HANDLER
-========================================================= */
-
-async function handleCallback(
-  env,
-  query
-) {
-  const userId =
-    String(
-      query.from?.id || ""
-    );
-
-  await telegram(
-    env,
-    "answerCallbackQuery",
-    {
-      callback_query_id:
-        query.id
-    }
-  ).catch(() => {});
-
-
-  /* ONLY ADMIN */
-
-  if (
-    userId !==
-    ADMIN_TELEGRAM_ID
-  ) {
-    await telegram(
-      env,
-      "sendMessage",
-      {
-        chat_id:
-          query.message.chat.id,
-
-        text:
-          "❌ Access denied."
+  try {
+    const v5 = WalletContractV5R1.create({
+      workchain: 0,
+      publicKey: keyPair.publicKey,
+      walletId: {
+        networkGlobalId: -239
       }
-    );
+    });
 
-    return;
+    v5Address = v5.address.toString({
+      bounceable: true,
+      urlSafe: true
+    });
+
+    result.v5r1 = {
+      derived_address: v5Address,
+      matches_sender: sameAddress(
+        v5Address,
+        PTN_SENDER_WALLET
+      ),
+      network: "mainnet",
+      network_global_id: -239
+    };
+  } catch (error) {
+    result.v5r1 = {
+      error: String(error?.message || error)
+    };
   }
 
+  /*
+   * Now inspect the ACTUAL configured sender address
+   * directly on TON.
+   *
+   * No transaction is created or sent.
+   */
+  let client;
 
-  /* -----------------------------------------
-     MANUAL PTN
-  ----------------------------------------- */
-
-  if (
-    query.data ===
-    "manual_ptn"
-  ) {
-    await setState(
-      env,
-      "destination"
-    );
-
-    await telegram(
-      env,
-      "sendMessage",
-      {
-        chat_id:
-          query.message.chat.id,
-
-        text:
-          "💸 Manual PTN Payment\n\n" +
-          "Send the destination TON wallet address.\n\n" +
-          "The destination wallet version does not matter.\n\n" +
-          "Send /cancel to cancel.",
-
-        reply_markup:
-          CANCEL_MENU
-      }
-    );
-
-    return;
+  try {
+    client = new TonClient({
+      endpoint: TONCENTER_ENDPOINT,
+      apiKey: env.TONCENTER_API_KEY
+    });
+  } catch (error) {
+    result.blockchain_client =
+      String(error?.message || error);
+    return result;
   }
 
+  const senderAddress =
+    Address.parse(PTN_SENDER_WALLET);
 
-  /* -----------------------------------------
-     CANCEL
-  ----------------------------------------- */
+  result.on_chain = {};
 
-  if (
-    query.data ===
-    "cancel"
-  ) {
-    await clearState(
-      env
-    );
+  try {
+    const state =
+      await client.getContractState(senderAddress);
 
-    await sendAdminMenu(
-      env,
-      query.message.chat.id,
-      "❌ Cancelled.\n\n🛠 PAYTON Admin Panel"
-    );
+    result.on_chain.state =
+      state.state;
 
-    return;
-  }
-}
+    result.on_chain.balance_gram =
+      state.balance?.toString?.() || null;
 
+    result.on_chain.code_present =
+      !!state.code;
 
-/* =========================================================
-   ADMIN MESSAGE HANDLER
-========================================================= */
-
-async function handleAdminMessage(
-  env,
-  message
-) {
-  const text =
-    String(
-      message.text || ""
-    ).trim();
-
-
-  if (!text) {
-    return;
+    result.on_chain.data_present =
+      !!state.data;
+  } catch (error) {
+    result.on_chain.state_error =
+      String(error?.message || error);
   }
 
-
-  /* -----------------------------------------
-     CANCEL
-  ----------------------------------------- */
-
-  if (
-    text ===
-    "/cancel"
-  ) {
-    await clearState(
-      env
-    );
-
-    await sendAdminMenu(
-      env,
-      message.chat.id,
-      "❌ Cancelled.\n\n🛠 PAYTON Admin Panel"
-    );
-
-    return;
-  }
-
-
-  /* -----------------------------------------
-     STATE
-  ----------------------------------------- */
-
-  const state =
-    await getState(env);
-
-
-  /* -----------------------------------------
-     DESTINATION
-  ----------------------------------------- */
-
-  if (
-    state?.mode ===
-    "destination"
-  ) {
-    try {
-
-      const destination =
-        parseDestination(
-          text
-        );
-
-
-      await setState(
-        env,
-        "amount",
-        destination.toString()
+  /*
+   * Read the public key stored INSIDE the actual wallet
+   * contract, if its getter is available.
+   *
+   * This is the most important part of this diagnostic.
+   */
+  try {
+    const publicKeyResult =
+      await client.runMethod(
+        senderAddress,
+        "get_public_key"
       );
 
+    const stack = publicKeyResult.stack;
 
-      await telegram(
-        env,
-        "sendMessage",
-        {
-          chat_id:
-            message.chat.id,
-
-          text:
-            "✅ Destination address accepted.\n\n" +
-            "Now send the PTN amount.\n\n" +
-            "Example: 1000000\n\n" +
-            "Maximum 9 decimal places.\n\n" +
-            "Send /cancel to cancel.",
-
-          reply_markup:
-            CANCEL_MENU
-        }
-      );
-
-    } catch (error) {
-
-      await telegram(
-        env,
-        "sendMessage",
-        {
-          chat_id:
-            message.chat.id,
-
-          text:
-            "❌ Invalid TON wallet address.\n\n" +
-            "Please send the destination address again.\n\n" +
-            "Send /cancel to cancel.",
-
-          reply_markup:
-            CANCEL_MENU
-        }
-      );
-    }
-
-    return;
-  }
-
-
-  /* -----------------------------------------
-     AMOUNT
-  ----------------------------------------- */
-
-  if (
-    state?.mode ===
-    "amount"
-  ) {
-
-    let parsed;
+    let onChainPublicKey = null;
 
     try {
+      const first = stack.readBigNumber();
 
-      parsed =
-        parsePtnAmount(
-          text
-        );
-
-    } catch (error) {
-
-      await telegram(
-        env,
-        "sendMessage",
-        {
-          chat_id:
-            message.chat.id,
-
-          text:
-            `❌ ${
-              error?.message ||
-              "Invalid PTN amount."
-            }\n\n` +
-            "Send the PTN amount again or /cancel.",
-
-          reply_markup:
-            CANCEL_MENU
-        }
-      );
-
-      return;
-    }
-
-
-    let destination;
-
-    try {
-
-      destination =
-        Address.parse(
-          state.destination
-        );
-
+      /*
+       * Public key is 256 bits, so BigNumber can represent
+       * it exactly enough for a hexadecimal comparison.
+       */
+      onChainPublicKey =
+        BigInt(first)
+          .toString(16)
+          .padStart(64, "0");
     } catch {
-
-      await clearState(
-        env
-      );
-
-      await sendAdminMenu(
-        env,
-        message.chat.id,
-        "❌ The destination address is invalid. Please start again."
-      );
-
-      return;
+      onChainPublicKey = null;
     }
 
+    result.on_chain.get_public_key =
+      onChainPublicKey
+        ? "AVAILABLE"
+        : "AVAILABLE_BUT_NOT_PARSED";
 
-    /* -----------------------------------------
-       SHOW CHECKING
-    ----------------------------------------- */
+    /*
+     * Compare the numeric public key without displaying it.
+     */
+    if (onChainPublicKey) {
+      const derivedPublicKey =
+        Buffer.from(keyPair.publicKey)
+          .toString("hex")
+          .toLowerCase();
 
-    await telegram(
-      env,
-      "sendMessage",
-      {
-        chat_id:
-          message.chat.id,
-
-        text:
-          "⏳ Checking sender wallet, PTN balance and network fee..."
-      }
-    );
-
-
-    /* -----------------------------------------
-       SEND
-    ----------------------------------------- */
-
-    const result =
-      await sendManualPTN(
-        env,
-        destination,
-        parsed.units
-      );
-
-
-    await clearState(
-      env
-    );
-
-
-    /* -----------------------------------------
-       SUCCESS
-    ----------------------------------------- */
-
-    if (
-      result.success
-    ) {
-
-      await sendAdminMenu(
-        env,
-        message.chat.id,
-
-        "✅ PTN transfer submitted successfully.\n\n" +
-
-        `Amount: ${parsed.display} PTN\n` +
-
-        `Destination:\n${destination.toString()}\n\n` +
-
-        `Sender wallet:\n${result.senderAddress}\n\n` +
-
-        `Sender wallet type: ${result.senderVersion}\n\n` +
-
-        `Query ID:\n${result.queryId}\n\n` +
-
-        "The PTN transfer has been submitted to the TON network."
-      );
-
-      return;
+      result.on_chain.public_key_matches_mnemonic =
+        onChainPublicKey.toLowerCase() ===
+        derivedPublicKey;
     }
+  } catch (error) {
+    result.on_chain.get_public_key =
+      "NOT_AVAILABLE_OR_NOT_STANDARD";
 
-
-    /* -----------------------------------------
-       ERROR
-    ----------------------------------------- */
-
-    await sendAdminMenu(
-      env,
-      message.chat.id,
-
-      "❌ PTN transfer failed.\n\n" +
-
-      `${result.error}\n\n` +
-
-      "No PTN transfer was submitted."
-    );
-  }
-}
-
-
-/* =========================================================
-   UPDATE HANDLER
-========================================================= */
-
-async function handleUpdate(
-  env,
-  update
-) {
-
-  /* -----------------------------------------
-     CALLBACK
-  ----------------------------------------- */
-
-  if (
-    update.callback_query
-  ) {
-    await handleCallback(
-      env,
-      update.callback_query
-    );
-
-    return;
+    result.on_chain.get_public_key_error =
+      String(error?.message || error);
   }
 
-
-  /* -----------------------------------------
-     MESSAGE
-  ----------------------------------------- */
-
-  const message =
-    update.message;
-
-  if (!message) {
-    return;
-  }
-
-
-  const chatId =
-    String(
-      message.chat?.id || ""
-    );
-
-
-  /* -----------------------------------------
-     ONLY ADMIN
-  ----------------------------------------- */
-
-  if (
-    chatId !==
-    ADMIN_TELEGRAM_ID
-  ) {
-
-    await telegram(
-      env,
-      "sendMessage",
-      {
-        chat_id:
-          chatId,
-
-        text:
-          "❌ Access denied."
-      }
-    );
-
-    return;
-  }
-
-
-  /* -----------------------------------------
-     START / MENU
-  ----------------------------------------- */
-
-  if (
-    message.text ===
-      "/start" ||
-
-    message.text ===
-      "/menu" ||
-
-    message.text ===
-      "/admin"
-  ) {
-
-    await clearState(
-      env
-    );
-
-    await sendAdminMenu(
-      env,
-      chatId
-    );
-
-    return;
-  }
-
-
-  /* -----------------------------------------
-     ADMIN TEXT
-  ----------------------------------------- */
-
-  await handleAdminMessage(
-    env,
-    message
-  );
-}
-
-
-/* =========================================================
-   CLOUDFLARE WORKER
-========================================================= */
-
-export default {
-
-  async fetch(
-    request,
-    env
-  ) {
-
-    if (
-      request.method !==
-      "POST"
-    ) {
-      return new Response(
-        "PAYTON Manual PTN Bot",
-        {
-          status: 200
-        }
+  try {
+    const subwalletResult =
+      await client.runMethod(
+        senderAddress,
+        "get_subwallet_id"
       );
-    }
 
+    let value = null;
 
     try {
-
-      const update =
-        await request.json();
-
-      await handleUpdate(
-        env,
-        update
-      );
-
-    } catch (error) {
-
-      console.error(
-        "WORKER ERROR:",
-        error?.message ||
-        String(error)
-      );
+      value =
+        subwalletResult.stack
+          .readBigNumber()
+          .toString();
+    } catch {
+      value = null;
     }
 
-
-    return new Response(
-      "OK",
-      {
-        status: 200
-      }
-    );
-  },
-
-
-  async scheduled() {
-    /*
-      No automatic processing.
-      This bot only performs manual PTN payments.
-    */
+    result.on_chain.subwallet_id =
+      value;
+  } catch (error) {
+    result.on_chain.subwallet_id =
+      "NOT_AVAILABLE_OR_NOT_STANDARD";
   }
 
-};
+  /*
+   * Final diagnosis.
+   */
+  const v4Match =
+    result.v4r2?.matches_sender === true;
+
+  const v5Match =
+    result.v5r1?.matches_sender === true;
+
+  const publicKeyMatch =
+    result.on_chain?.public_key_matches_mnemonic === true;
+
+  if (v4Match || v5Match) {
+    result.diagnosis =
+      "MNEMONIC_MATCHES_CONFIGURED_WALLET";
+  } else if (publicKeyMatch) {
+    result.diagnosis =
+      "MNEMONIC_PUBLIC_KEY_MATCHES_ON_CHAIN_WALLET_BUT_WALLET_CON
