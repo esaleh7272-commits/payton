@@ -1,33 +1,173 @@
 import { Buffer } from "buffer";
-import { Address } from "@ton/core";
+
+import {
+  Address,
+  beginCell,
+  internal,
+  SendMode,
+  toNano
+} from "@ton/core";
+
 import {
   TonClient,
-  WalletContractV4,
-  WalletContractV5R1
+  WalletContractV5R1,
+  JettonMaster,
+  JettonWallet
 } from "@ton/ton";
 
 globalThis.Buffer = Buffer;
 
+
+// ==================================================
+// CONFIG
+// ==================================================
+
 const ADMIN_TELEGRAM_ID = "113074274";
+
+const PTN_MASTER =
+  "EQAZ_Rw9M91opByfYz1edG0TbeAKP72WcdccprkZvbvPVkAZ";
 
 const PTN_SENDER_WALLET =
   "UQD9eW663lS-7SeGVyYK_cQlKBSjzWSbxaBkgUTigTjZ9Hh6";
 
+const PTN_DECIMALS = 9;
+
 const TONCENTER_ENDPOINT =
   "https://toncenter.com/api/v2/jsonRPC";
 
+// TON sent to the PTN Jetton Wallet with the transfer.
+// This is NOT PTN amount. It is network gas/value.
+const JETTON_TRANSFER_VALUE =
+  toNano("0.05");
 
-function json(data, status = 200) {
-  return new Response(JSON.stringify(data, null, 2), {
-    status,
-    headers: {
-      "content-type": "application/json; charset=utf-8"
-    }
-  });
+const MIN_SENDER_TON =
+  toNano("0.10");
+
+
+// ==================================================
+// TEMPORARY ADMIN SESSION
+// ==================================================
+//
+// The admin flow is:
+//
+// Manual PTN Payment
+//       ↓
+// destination address
+//       ↓
+// PTN amount
+//       ↓
+// send
+//
+// No destination wallet V4/V5 detection is performed.
+// The destination is simply a TON Address.
+//
+
+const sessions = new Map();
+
+
+// ==================================================
+// TELEGRAM HELPERS
+// ==================================================
+
+async function telegram(env, method, body) {
+
+  const url =
+    `https://api.telegram.org/bot${env.BOT_TOKEN}/${method}`;
+
+  const response =
+    await fetch(url, {
+      method: "POST",
+
+      headers: {
+        "content-type": "application/json"
+      },
+
+      body: JSON.stringify(body)
+    });
+
+  return response.json();
 }
 
 
+async function sendMessage(
+  env,
+  chatId,
+  text,
+  keyboard = null
+) {
+
+  const body = {
+    chat_id: chatId,
+    text
+  };
+
+  if (keyboard) {
+    body.reply_markup = keyboard;
+  }
+
+  return telegram(
+    env,
+    "sendMessage",
+    body
+  );
+}
+
+
+async function answerCallback(
+  env,
+  callbackId
+) {
+
+  return telegram(
+    env,
+    "answerCallbackQuery",
+    {
+      callback_query_id: callbackId
+    }
+  );
+}
+
+
+// ==================================================
+// KEYBOARD
+// ==================================================
+
+function mainKeyboard() {
+
+  return {
+    inline_keyboard: [
+      [
+        {
+          text: "💸 Manual PTN Payment",
+          callback_data: "manual_ptn"
+        }
+      ]
+    ]
+  };
+}
+
+
+function cancelKeyboard() {
+
+  return {
+    inline_keyboard: [
+      [
+        {
+          text: "❌ Cancel",
+          callback_data: "cancel_payment"
+        }
+      ]
+    ]
+  };
+}
+
+
+// ==================================================
+// MNEMONIC
+// ==================================================
+
 function normalizeMnemonic(raw) {
+
   return String(raw || "")
     .trim()
     .replace(/\s+/g, " ")
@@ -36,587 +176,867 @@ function normalizeMnemonic(raw) {
 }
 
 
-function sameAddress(a, b) {
-  try {
-    return Address.parse(a).equals(Address.parse(b));
-  } catch {
-    return false;
+// ==================================================
+// PTN AMOUNT PARSER
+// ==================================================
+
+function parsePtnAmount(value) {
+
+  const input =
+    String(value || "")
+      .trim()
+      .replace(/,/g, "");
+
+  if (!input) {
+    throw new Error(
+      "PTN amount is required."
+    );
   }
-}
 
 
-async function telegram(env, method, body) {
-  const url =
-    `https://api.telegram.org/bot${env.BOT_TOKEN}/${method}`;
+  if (!/^\d+(\.\d{1,9})?$/.test(input)) {
 
-  const response = await fetch(url, {
-    method: "POST",
-    headers: {
-      "content-type": "application/json"
-    },
-    body: JSON.stringify(body)
-  });
-
-  return response.json();
-}
+    throw new Error(
+      "Invalid PTN amount. Use numbers with up to 9 decimal places."
+    );
+  }
 
 
-async function sendMessage(env, chatId, text) {
-  return telegram(env, "sendMessage", {
-    chat_id: chatId,
-    text
-  });
-}
+  const parts =
+    input.split(".");
 
+  const whole =
+    parts[0];
 
-async function runDiagnostic(env) {
+  const fraction =
+    parts[1] || "";
 
-  const result = {
-    test: "PTN sender wallet diagnostic",
-    transaction_sent: false,
-    configured_sender: PTN_SENDER_WALLET
+  const padded =
+    fraction.padEnd(
+      PTN_DECIMALS,
+      "0"
+    );
+
+  const nanoString =
+    whole + padded;
+
+  const amount =
+    BigInt(nanoString);
+
+  if (amount <= 0n) {
+    throw new Error(
+      "PTN amount must be greater than zero."
+    );
+  }
+
+  return {
+    display: input,
+    nano: amount
   };
+}
 
 
-  // --------------------------------------------------
-  // Check mnemonic secret
-  // --------------------------------------------------
+// ==================================================
+// ADDRESS
+// ==================================================
+
+function parseDestination(value) {
+
+  const input =
+    String(value || "").trim();
+
+  if (!input) {
+    throw new Error(
+      "Wallet address is required."
+    );
+  }
+
+
+  /*
+   * IMPORTANT:
+   *
+   * The destination is ONLY an Address.
+   *
+   * We do NOT determine whether the destination
+   * wallet is V4, V5, V3, etc.
+   */
+
+  return Address.parse(input);
+}
+
+
+// ==================================================
+// CLIENT
+// ==================================================
+
+function createClient(env) {
+
+  return new TonClient({
+    endpoint:
+      TONCENTER_ENDPOINT,
+
+    apiKey:
+      env.TONCENTER_API_KEY
+  });
+}
+
+
+// ==================================================
+// CREATE V5R1 SENDER
+// ==================================================
+
+async function createSenderWallet(env) {
 
   if (!env.PTN_MNEMONIC) {
-    result.error =
-      "PTN_MNEMONIC secret is missing.";
 
-    return result;
+    throw new Error(
+      "PTN_MNEMONIC secret is missing."
+    );
   }
 
 
   const words =
-    normalizeMnemonic(env.PTN_MNEMONIC);
+    normalizeMnemonic(
+      env.PTN_MNEMONIC
+    );
 
-  result.mnemonic_word_count =
-    words.length;
 
+  if (
+    words.length !== 12 &&
+    words.length !== 24
+  ) {
 
-  if (words.length !== 12 && words.length !== 24) {
-    result.mnemonic_status =
-      "INVALID_WORD_COUNT";
-
-    return result;
+    throw new Error(
+      "Invalid mnemonic word count."
+    );
   }
 
 
-  // --------------------------------------------------
-  // Load TON crypto
-  // --------------------------------------------------
+  /*
+   * Cloudflare Workers compatibility.
+   */
 
-  let cryptoModule;
-
-  try {
-
-    if (typeof globalThis.window === "undefined") {
-      globalThis.window = globalThis;
-    }
-
-    cryptoModule =
-      await import("@ton/crypto");
-
-  } catch (error) {
-
-    result.mnemonic_status =
-      "CRYPTO_IMPORT_FAILED";
-
-    result.error =
-      String(error?.message || error);
-
-    return result;
+  if (
+    typeof globalThis.window ===
+    "undefined"
+  ) {
+    globalThis.window =
+      globalThis;
   }
 
 
-  // --------------------------------------------------
-  // Validate mnemonic
-  // --------------------------------------------------
-
-  let mnemonicValid = false;
-
-  try {
-
-    if (
-      typeof cryptoModule.mnemonicValidate ===
-      "function"
-    ) {
-
-      mnemonicValid =
-        await cryptoModule.mnemonicValidate(words);
-
-    } else {
-
-      result.mnemonic_validation =
-        "VALIDATION_FUNCTION_NOT_AVAILABLE";
-
-      mnemonicValid = true;
-    }
-
-  } catch (error) {
-
-    result.mnemonic_status =
-      "MNEMONIC_VALIDATION_ERROR";
-
-    result.error =
-      String(error?.message || error);
-
-    return result;
-  }
+  const cryptoModule =
+    await import("@ton/crypto");
 
 
-  result.mnemonic_valid =
-    mnemonicValid;
+  const mnemonicValid =
+    await cryptoModule.mnemonicValidate(
+      words
+    );
 
 
   if (!mnemonicValid) {
 
-    result.mnemonic_status =
-      "INVALID_TON_MNEMONIC";
-
-    return result;
+    throw new Error(
+      "The configured mnemonic is not a valid TON mnemonic."
+    );
   }
 
 
-  // --------------------------------------------------
-  // Derive key pair from mnemonic
-  // --------------------------------------------------
+  const keyPair =
+    await cryptoModule.mnemonicToPrivateKey(
+      words
+    );
 
-  let keyPair;
 
-  try {
+  /*
+   * IMPORTANT:
+   *
+   * This is the wallet type confirmed by
+   * the diagnostic test.
+   */
 
-    keyPair =
-      await cryptoModule.mnemonicToPrivateKey(words);
+  const wallet =
+    WalletContractV5R1.create({
 
-  } catch (error) {
+      workchain: 0,
 
-    result.mnemonic_status =
-      "KEY_DERIVATION_FAILED";
+      publicKey:
+        keyPair.publicKey,
 
-    result.error =
-      String(error?.message || error);
+      walletId: {
+        networkGlobalId: -239
+      }
+    });
 
-    return result;
-  }
 
+  /*
+   * Absolute safety check.
+   *
+   * Do not sign anything unless the derived wallet
+   * is exactly the configured sender wallet.
+   */
 
-  result.key_derivation =
-    "SUCCESS";
+  const configured =
+    Address.parse(
+      PTN_SENDER_WALLET
+    );
 
 
-  // --------------------------------------------------
-  // Derive V4R2 wallet
-  // --------------------------------------------------
-
-  let v4Address = null;
-
-  try {
-
-    const v4 =
-      WalletContractV4.create({
-        workchain: 0,
-        publicKey: keyPair.publicKey,
-        walletId: 0x29a9a317
-      });
-
-
-    v4Address =
-      v4.address.toString({
-        bounceable: true,
-        urlSafe: true
-      });
-
-
-    result.v4r2 = {
-      derived_address: v4Address,
-
-      matches_sender:
-        sameAddress(
-          v4Address,
-          PTN_SENDER_WALLET
-        ),
-
-      wallet_id:
-        "0x29a9a317"
-    };
-
-  } catch (error) {
-
-    result.v4r2 = {
-      error:
-        String(error?.message || error)
-    };
-  }
-
-
-  // --------------------------------------------------
-  // Derive V5R1 wallet
-  // --------------------------------------------------
-
-  let v5Address = null;
-
-  try {
-
-    const v5 =
-      WalletContractV5R1.create({
-        workchain: 0,
-        publicKey: keyPair.publicKey,
-
-        walletId: {
-          networkGlobalId: -239
-        }
-      });
-
-
-    v5Address =
-      v5.address.toString({
-        bounceable: true,
-        urlSafe: true
-      });
-
-
-    result.v5r1 = {
-      derived_address: v5Address,
-
-      matches_sender:
-        sameAddress(
-          v5Address,
-          PTN_SENDER_WALLET
-        ),
-
-      network:
-        "mainnet",
-
-      network_global_id:
-        -239
-    };
-
-  } catch (error) {
-
-    result.v5r1 = {
-      error:
-        String(error?.message || error)
-    };
-  }
-
-
-  // --------------------------------------------------
-  // Connect to TON
-  // --------------------------------------------------
-
-  let client;
-
-  try {
-
-    client =
-      new TonClient({
-        endpoint:
-          TONCENTER_ENDPOINT,
-
-        apiKey:
-          env.TONCENTER_API_KEY
-      });
-
-  } catch (error) {
-
-    result.blockchain_client =
-      String(error?.message || error);
-
-    return result;
-  }
-
-
-  // --------------------------------------------------
-  // Parse actual sender address
-  // --------------------------------------------------
-
-  let senderAddress;
-
-  try {
-
-    senderAddress =
-      Address.parse(
-        PTN_SENDER_WALLET
-      );
-
-  } catch (error) {
-
-    result.sender_address_error =
-      String(error?.message || error);
-
-    return result;
-  }
-
-
-  // --------------------------------------------------
-  // Read actual sender wallet state
-  // --------------------------------------------------
-
-  result.on_chain = {};
-
-  try {
-
-    const state =
-      await client.getContractState(
-        senderAddress
-      );
-
-
-    result.on_chain.state =
-      state.state;
-
-    result.on_chain.balance_gram =
-      state.balance?.toString?.() ||
-      null;
-
-    result.on_chain.code_present =
-      !!state.code;
-
-    result.on_chain.data_present =
-      !!state.data;
-
-  } catch (error) {
-
-    result.on_chain.state_error =
-      String(error?.message || error);
-  }
-
-
-  // --------------------------------------------------
-  // Read public key from actual wallet
-  // --------------------------------------------------
-
-  try {
-
-    const publicKeyResult =
-      await client.runMethod(
-        senderAddress,
-        "get_public_key"
-      );
-
-
-    let onChainPublicKey = null;
-
-    try {
-
-      const first =
-        publicKeyResult.stack.readBigNumber();
-
-      onChainPublicKey =
-        BigInt(first)
-          .toString(16)
-          .padStart(64, "0");
-
-    } catch {
-
-      onChainPublicKey = null;
-    }
-
-
-    result.on_chain.get_public_key =
-      onChainPublicKey
-        ? "AVAILABLE"
-        : "AVAILABLE_BUT_NOT_PARSED";
-
-
-    // Never display the actual public key.
-    // Only compare it internally.
-
-    if (onChainPublicKey) {
-
-      const derivedPublicKey =
-        Buffer.from(
-          keyPair.publicKey
-        )
-          .toString("hex")
-          .toLowerCase();
-
-
-      result.on_chain.public_key_matches_mnemonic =
-        onChainPublicKey.toLowerCase() ===
-        derivedPublicKey;
-    }
-
-  } catch (error) {
-
-    result.on_chain.get_public_key =
-      "NOT_AVAILABLE_OR_NOT_STANDARD";
-
-    result.on_chain.get_public_key_error =
-      String(error?.message || error);
-  }
-
-
-  // --------------------------------------------------
-  // Read subwallet ID if available
-  // --------------------------------------------------
-
-  try {
-
-    const subwalletResult =
-      await client.runMethod(
-        senderAddress,
-        "get_subwallet_id"
-      );
-
-
-    let value = null;
-
-    try {
-
-      value =
-        subwalletResult.stack
-          .readBigNumber()
-          .toString();
-
-    } catch {
-
-      value = null;
-    }
-
-
-    result.on_chain.subwallet_id =
-      value;
-
-  } catch {
-
-    result.on_chain.subwallet_id =
-      "NOT_AVAILABLE_OR_NOT_STANDARD";
-  }
-
-
-  // --------------------------------------------------
-  // Final diagnosis
-  // --------------------------------------------------
-
-  const v4Match =
-    result.v4r2?.matches_sender === true;
-
-  const v5Match =
-    result.v5r1?.matches_sender === true;
-
-  const publicKeyMatch =
-    result.on_chain
-      ?.public_key_matches_mnemonic === true;
-
-
-  if (v4Match || v5Match) {
-
-    result.diagnosis =
-      "MNEMONIC_MATCHES_CONFIGURED_WALLET";
-
-  } else if (publicKeyMatch) {
-
-    result.diagnosis =
-      "MNEMONIC_PUBLIC_KEY_MATCHES_ON_CHAIN_WALLET_BUT_WALLET_CONTRACT_OR_WALLET_ID_IS_DIFFERENT";
-
-  } else if (
-    result.on_chain
-      ?.public_key_matches_mnemonic === false
+  if (
+    !wallet.address.equals(
+      configured
+    )
   ) {
 
-    result.diagnosis =
-      "MNEMONIC_DERIVES_A_DIFFERENT_PUBLIC_KEY_THAN_THE_CONFIGURED_SENDER";
-
-  } else {
-
-    result.diagnosis =
-      "MNEMONIC_DERIVATION_WORKED_BUT_WALLET_TYPE_OR_DERIVATION_SCHEME_IS_NOT_YET_IDENTIFIED";
+    throw new Error(
+      "The mnemonic does not derive the configured PTN sender wallet. No transaction was sent."
+    );
   }
 
 
-  result.safety =
-    "DIAGNOSTIC_ONLY. NO TRANSACTION WAS CREATED OR SENT.";
-
-
-  return result;
+  return {
+    wallet,
+    keyPair
+  };
 }
 
 
 // ==================================================
-// TELEGRAM
+// CHECK TON BALANCE
 // ==================================================
 
-async function handleTelegramUpdate(env, update) {
+async function checkTonBalance(
+  client,
+  wallet
+) {
+
+  const balance =
+    await client.getBalance(
+      wallet.address
+    );
+
+
+  if (
+    balance <
+    MIN_SENDER_TON
+  ) {
+
+    throw new Error(
+      `Insufficient TON balance for network fees. Current balance: ${Number(balance) / 1e9} TON.`
+    );
+  }
+
+
+  return balance;
+}
+
+
+// ==================================================
+// GET PTN JETTON WALLET
+// ==================================================
+
+async function getPtnJettonWallet(
+  client,
+  senderAddress
+) {
+
+  const master =
+    client.open(
+      JettonMaster.create(
+        Address.parse(
+          PTN_MASTER
+        )
+      )
+    );
+
+
+  const jettonWalletAddress =
+    await master.getWalletAddress(
+      senderAddress
+    );
+
+
+  return client.open(
+    JettonWallet.create(
+      jettonWalletAddress
+    )
+  );
+}
+
+
+// ==================================================
+// CHECK PTN BALANCE
+// ==================================================
+
+async function checkPtnBalance(
+  jettonWallet,
+  requiredAmount
+) {
+
+  const balance =
+    await jettonWallet.getBalance();
+
+
+  if (
+    balance <
+    requiredAmount
+  ) {
+
+    const human =
+      Number(balance) /
+      10 ** PTN_DECIMALS;
+
+    throw new Error(
+      `Insufficient PTN balance. Available: ${human} PTN.`
+    );
+  }
+
+
+  return balance;
+}
+
+
+// ==================================================
+// SEND PTN
+// ==================================================
+
+async function sendPtn(
+  env,
+  destination,
+  amount
+) {
+
+  const client =
+    createClient(env);
+
+
+  // ----------------------------------------------
+  // Create V5R1 sender from mnemonic
+  // ----------------------------------------------
+
+  const {
+    wallet,
+    keyPair
+  } =
+    await createSenderWallet(env);
+
+
+  // ----------------------------------------------
+  // Check TON balance
+  // ----------------------------------------------
+
+  const tonBalance =
+    await checkTonBalance(
+      client,
+      wallet
+    );
+
+
+  // ----------------------------------------------
+  // Get sender PTN Jetton Wallet
+  // ----------------------------------------------
+
+  const ptnWallet =
+    await getPtnJettonWallet(
+      client,
+      wallet.address
+    );
+
+
+  // ----------------------------------------------
+  // Check PTN balance
+  // ----------------------------------------------
+
+  const ptnBalance =
+    await checkPtnBalance(
+      ptnWallet,
+      amount.nano
+    );
+
+
+  // ----------------------------------------------
+  // Build Jetton transfer
+  // ----------------------------------------------
+
+  const queryId =
+    BigInt(
+      Date.now()
+    );
+
+
+  /*
+   * Standard Jetton transfer body:
+   *
+   * opcode
+   * query_id
+   * amount
+   * destination
+   * response_destination
+   * custom_payload
+   * forward_ton_amount
+   * forward_payload
+   *
+   * Destination is simply a TON Address.
+   */
+
+  const body =
+    beginCell()
+
+      .storeUint(
+        0x0f8a7ea5,
+        32
+      )
+
+      .storeUint(
+        queryId,
+        64
+      )
+
+      .storeCoins(
+        amount.nano
+      )
+
+      .storeAddress(
+        destination
+      )
+
+      .storeAddress(
+        wallet.address
+      )
+
+      .storeBit(0)
+
+      /*
+       * TON attached to the Jetton transfer.
+       * This pays the Jetton-wallet processing/forwarding
+       * costs.
+       */
+
+      .storeCoins(
+        toNano("0.01")
+      )
+
+      /*
+       * No forward payload.
+       */
+
+      .storeBit(0)
+
+      .endCell();
+
 
   const message =
-    update?.message;
+    internal({
 
-  if (!message) {
-    return;
-  }
+      to:
+        ptnWallet.address,
 
+      value:
+        JETTON_TRANSFER_VALUE,
+
+      bounce:
+        true,
+
+      body
+    });
+
+
+  // ----------------------------------------------
+  // Open V5 wallet
+  // ----------------------------------------------
+
+  const senderContract =
+    client.open(
+      wallet
+    );
+
+
+  // ----------------------------------------------
+  // Get current seqno
+  // ----------------------------------------------
+
+  const seqno =
+    await senderContract.getSeqno();
+
+
+  // ----------------------------------------------
+  // Create and send V5R1 signed transfer
+  // ----------------------------------------------
+
+  await senderContract.sendTransfer({
+
+    seqno,
+
+    secretKey:
+      keyPair.secretKey,
+
+    messages: [
+      message
+    ],
+
+    sendMode:
+      SendMode.PAY_GAS_SEPARATELY,
+
+    /*
+     * V5 signed message validity.
+     */
+
+    timeout:
+      Math.floor(
+        Date.now() / 1000
+      ) + 300
+  });
+
+
+  return {
+
+    sender:
+      wallet.address.toString({
+        bounceable: true,
+        urlSafe: true
+      }),
+
+    jettonWallet:
+      ptnWallet.address.toString({
+        bounceable: true,
+        urlSafe: true
+      }),
+
+    destination:
+      destination.toString({
+        bounceable: true,
+        urlSafe: true
+      }),
+
+    ptnAmount:
+      amount.display,
+
+    ptnAmountNano:
+      amount.nano.toString(),
+
+    queryId:
+      queryId.toString(),
+
+    seqno,
+
+    tonBalance:
+      tonBalance.toString(),
+
+    ptnBalance:
+      ptnBalance.toString()
+  };
+}
+
+
+// ==================================================
+// MAIN MENU
+// ==================================================
+
+async function showMainMenu(
+  env,
+  chatId
+) {
+
+  await sendMessage(
+    env,
+    chatId,
+    "PAYTON PTN Sender\n\nChoose an action:",
+    mainKeyboard()
+  );
+}
+
+
+// ==================================================
+// CALLBACK HANDLER
+// ==================================================
+
+async function handleCallback(
+  env,
+  callback
+) {
+
+  const callbackId =
+    callback.id;
+
+  const fromId =
+    String(
+      callback.from?.id || ""
+    );
 
   const chatId =
-    String(message.chat?.id || "");
+    String(
+      callback.message?.chat?.id || ""
+    );
+
+  const data =
+    callback.data;
+
+
+  if (
+    fromId !==
+    ADMIN_TELEGRAM_ID
+  ) {
+
+    await answerCallback(
+      env,
+      callbackId
+    );
+
+    return;
+  }
+
+
+  await answerCallback(
+    env,
+    callbackId
+  );
+
+
+  // ----------------------------------------------
+  // Manual PTN
+  // ----------------------------------------------
+
+  if (
+    data ===
+    "manual_ptn"
+  ) {
+
+    sessions.set(
+      chatId,
+      {
+        step:
+          "destination"
+      }
+    );
+
+
+    await sendMessage(
+      env,
+      chatId,
+
+      "💸 Manual PTN Payment\n\n" +
+      "Send the destination TON wallet address.\n\n" +
+      "The destination is treated only as a TON address.\n" +
+      "V4/V5 detection is not used.",
+
+      cancelKeyboard()
+    );
+
+    return;
+  }
+
+
+  // ----------------------------------------------
+  // Cancel
+  // ----------------------------------------------
+
+  if (
+    data ===
+    "cancel_payment"
+  ) {
+
+    sessions.delete(
+      chatId
+    );
+
+
+    await sendMessage(
+      env,
+      chatId,
+      "❌ Payment cancelled."
+    );
+
+
+    await showMainMenu(
+      env,
+      chatId
+    );
+
+    return;
+  }
+}
+
+
+// ==================================================
+// MESSAGE HANDLER
+// ==================================================
+
+async function handleMessage(
+  env,
+  message
+) {
 
   const userId =
-    String(message.from?.id || "");
+    String(
+      message.from?.id || ""
+    );
 
-
-  if (userId !== ADMIN_TELEGRAM_ID) {
-    return;
-  }
-
+  const chatId =
+    String(
+      message.chat?.id || ""
+    );
 
   const text =
-    String(message.text || "").trim();
+    String(
+      message.text || ""
+    ).trim();
 
 
-  // --------------------------------------------------
+  // ----------------------------------------------
+  // ADMIN ONLY
+  // ----------------------------------------------
+
+  if (
+    userId !==
+    ADMIN_TELEGRAM_ID
+  ) {
+    return;
+  }
+
+
+  // ----------------------------------------------
   // START
-  // --------------------------------------------------
+  // ----------------------------------------------
 
-  if (text === "/start") {
+  if (
+    text ===
+    "/start"
+  ) {
+
+    sessions.delete(
+      chatId
+    );
 
     await sendMessage(
       env,
       chatId,
-
-      "PAYTON diagnostic bot.\n\n" +
-      "Send /diag to check the PTN sender wallet.\n\n" +
-      "No transaction will be sent."
+      "PAYTON PTN Sender",
+      mainKeyboard()
     );
 
     return;
   }
 
 
-  // --------------------------------------------------
-  // DIAGNOSTIC
-  // --------------------------------------------------
+  // ----------------------------------------------
+  // CANCEL COMMAND
+  // ----------------------------------------------
 
-  if (text === "/diag") {
+  if (
+    text ===
+    "/cancel"
+  ) {
+
+    sessions.delete(
+      chatId
+    );
+
 
     await sendMessage(
       env,
       chatId,
-
-      "🔎 Running wallet diagnostic...\n\n" +
-      "No transaction will be sent."
+      "❌ Payment cancelled."
     );
 
+
+    await showMainMenu(
+      env,
+      chatId
+    );
+
+    return;
+  }
+
+
+  // ----------------------------------------------
+  // MAIN MENU
+  // ----------------------------------------------
+
+  if (
+    text ===
+    "/menu"
+  ) {
+
+    sessions.delete(
+      chatId
+    );
+
+
+    await showMainMenu(
+      env,
+      chatId
+    );
+
+    return;
+  }
+
+
+  // ----------------------------------------------
+  // SESSION
+  // ----------------------------------------------
+
+  const session =
+    sessions.get(
+      chatId
+    );
+
+
+  if (!session) {
+
+    await showMainMenu(
+      env,
+      chatId
+    );
+
+    return;
+  }
+
+
+  // ----------------------------------------------
+  // STEP 1 - DESTINATION
+  // ----------------------------------------------
+
+  if (
+    session.step ===
+    "destination"
+  ) {
 
     try {
 
-      const result =
-        await runDiagnostic(env);
+      const destination =
+        parseDestination(
+          text
+        );
+
+
+      session.destination =
+        destination.toString({
+          bounceable: true,
+          urlSafe: true
+        });
+
+      session.step =
+        "amount";
+
+
+      sessions.set(
+        chatId,
+        session
+      );
 
 
       await sendMessage(
         env,
         chatId,
 
-        "🔎 DIAGNOSTIC RESULT\n\n" +
-        JSON.stringify(
-          result,
-          null,
-          2
-        )
+        "✅ Destination accepted.\n\n" +
+        "Now send the PTN amount.\n\n" +
+        "Example: 1000\n" +
+        "Maximum 9 decimal places.\n\n" +
+        "Send /cancel to cancel.",
+
+        cancelKeyboard()
       );
 
     } catch (error) {
@@ -625,10 +1045,8 @@ async function handleTelegramUpdate(env, update) {
         env,
         chatId,
 
-        "❌ Diagnostic failed.\n\n" +
-        String(
-          error?.message || error
-        )
+        "❌ Invalid TON wallet address.\n\n" +
+        "Please send a valid TON address or /cancel."
       );
     }
 
@@ -636,12 +1054,316 @@ async function handleTelegramUpdate(env, update) {
   }
 
 
+  // ----------------------------------------------
+  // STEP 2 - PTN AMOUNT
+  // ----------------------------------------------
+
+  if (
+    session.step ===
+    "amount"
+  ) {
+
+    let amount;
+
+    try {
+
+      amount =
+        parsePtnAmount(
+          text
+        );
+
+    } catch (error) {
+
+      await sendMessage(
+        env,
+        chatId,
+
+        "❌ " +
+        String(
+          error?.message ||
+          error
+        )
+      );
+
+      return;
+    }
+
+
+    // --------------------------------------------
+    // Confirmation
+    // --------------------------------------------
+
+    session.amount =
+      amount.display;
+
+    session.step =
+      "confirm";
+
+
+    sessions.set(
+      chatId,
+      session
+    );
+
+
+    await sendMessage(
+      env,
+      chatId,
+
+      "⚠️ Confirm PTN transfer\n\n" +
+
+      "Destination:\n" +
+      session.destination +
+      "\n\n" +
+
+      "PTN amount:\n" +
+      amount.display +
+      " PTN\n\n" +
+
+      "Press Confirm to send the transaction.",
+
+      {
+        inline_keyboard: [
+          [
+            {
+              text: "✅ Confirm & Send",
+              callback_data:
+                "confirm_ptn"
+            }
+          ],
+          [
+            {
+              text: "❌ Cancel",
+              callback_data:
+                "cancel_payment"
+            }
+          ]
+        ]
+      }
+    );
+
+    return;
+  }
+}
+
+
+// ==================================================
+// CONFIRM CALLBACK
+// ==================================================
+
+async function handleConfirm(
+  env,
+  callback
+) {
+
+  const fromId =
+    String(
+      callback.from?.id || ""
+    );
+
+  const chatId =
+    String(
+      callback.message?.chat?.id || ""
+    );
+
+
+  if (
+    fromId !==
+    ADMIN_TELEGRAM_ID
+  ) {
+
+    await answerCallback(
+      env,
+      callback.id
+    );
+
+    return;
+  }
+
+
+  await answerCallback(
+    env,
+    callback.id
+  );
+
+
+  const session =
+    sessions.get(
+      chatId
+    );
+
+
+  if (
+    !session ||
+    session.step !==
+    "confirm"
+  ) {
+
+    await sendMessage(
+      env,
+      chatId,
+      "❌ Payment session expired. Please start again."
+    );
+
+    return;
+  }
+
+
+  /*
+   * Delete the session BEFORE sending.
+   *
+   * This prevents an accidental second click
+   * from using the same session twice.
+   */
+
+  sessions.delete(
+    chatId
+  );
+
+
   await sendMessage(
     env,
     chatId,
 
-    "Send /diag to run the sender-wallet diagnostic."
+    "⏳ Checking sender wallet, PTN balance and network fee...\n\n" +
+    "No destination wallet version detection is used."
   );
+
+
+  try {
+
+    const destination =
+      parseDestination(
+        session.destination
+      );
+
+
+    const amount =
+      parsePtnAmount(
+        session.amount
+      );
+
+
+    const result =
+      await sendPtn(
+        env,
+        destination,
+        amount
+      );
+
+
+    await sendMessage(
+      env,
+      chatId,
+
+      "✅ PTN transfer submitted.\n\n" +
+
+      "Amount: " +
+      result.ptnAmount +
+      " PTN\n\n" +
+
+      "Destination:\n" +
+      result.destination +
+      "\n\n" +
+
+      "Sender:\n" +
+      result.sender +
+      "\n\n" +
+
+      "Seqno: " +
+      result.seqno +
+      "\n\n" +
+
+      "The transaction has been submitted to the TON network."
+    );
+
+
+    await showMainMenu(
+      env,
+      chatId
+    );
+
+  } catch (error) {
+
+    await sendMessage(
+      env,
+      chatId,
+
+      "❌ PTN transfer failed.\n\n" +
+      String(
+        error?.message ||
+        error
+      ) +
+      "\n\n" +
+      "No successful PTN transfer was confirmed by this bot."
+    );
+
+
+    await showMainMenu(
+      env,
+      chatId
+    );
+  }
+}
+
+
+// ==================================================
+// TELEGRAM UPDATE
+// ==================================================
+
+async function handleTelegramUpdate(
+  env,
+  update
+) {
+
+  // ----------------------------------------------
+  // Callback query
+  // ----------------------------------------------
+
+  if (
+    update?.callback_query
+  ) {
+
+    const callback =
+      update.callback_query;
+
+
+    if (
+      callback.data ===
+      "confirm_ptn"
+    ) {
+
+      await handleConfirm(
+        env,
+        callback
+      );
+
+      return;
+    }
+
+
+    await handleCallback(
+      env,
+      callback
+    );
+
+    return;
+  }
+
+
+  // ----------------------------------------------
+  // Message
+  // ----------------------------------------------
+
+  if (
+    update?.message
+  ) {
+
+    await handleMessage(
+      env,
+      update.message
+    );
+  }
 }
 
 
@@ -651,45 +1373,24 @@ async function handleTelegramUpdate(env, update) {
 
 export default {
 
-  async fetch(request, env) {
+  async fetch(
+    request,
+    env
+  ) {
 
     try {
 
-      // ----------------------------------------------
+      // --------------------------------------------
       // GET
-      // ----------------------------------------------
+      // --------------------------------------------
 
-      if (request.method === "GET") {
-
-        const url =
-          new URL(request.url);
-
-
-        if (url.pathname === "/diag") {
-
-          if (!env.PTN_MNEMONIC) {
-
-            return json(
-              {
-                ok: false,
-                error:
-                  "PTN_MNEMONIC secret is missing."
-              },
-              500
-            );
-          }
-
-
-          const result =
-            await runDiagnostic(env);
-
-
-          return json(result);
-        }
-
+      if (
+        request.method ===
+        "GET"
+      ) {
 
         return new Response(
-          "PAYTON diagnostic worker is running.",
+          "PAYTON PTN Sender is running.",
           {
             status: 200
           }
@@ -697,11 +1398,14 @@ export default {
       }
 
 
-      // ----------------------------------------------
-      // POST - Telegram webhook
-      // ----------------------------------------------
+      // --------------------------------------------
+      // POST
+      // --------------------------------------------
 
-      if (request.method === "POST") {
+      if (
+        request.method ===
+        "POST"
+      ) {
 
         const update =
           await request.json();
@@ -713,7 +1417,12 @@ export default {
         );
 
 
-        return new Response("OK");
+        return new Response(
+          "OK",
+          {
+            status: 200
+          }
+        );
       }
 
 
@@ -726,15 +1435,24 @@ export default {
 
     } catch (error) {
 
-      return json(
-        {
+      return new Response(
+        JSON.stringify({
           ok: false,
+
           error:
             String(
-              error?.message || error
+              error?.message ||
+              error
             )
-        },
-        500
+        }),
+        {
+          status: 500,
+
+          headers: {
+            "content-type":
+              "application/json"
+          }
+        }
       );
     }
   }
