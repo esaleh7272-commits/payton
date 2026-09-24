@@ -394,4 +394,348 @@ async function runDiagnostic(env) {
 
     const publicKeyResult =
       await client.runMethod(
-        sender
+        senderAddress,
+        "get_public_key"
+      );
+
+
+    let onChainPublicKey = null;
+
+    try {
+
+      const first =
+        publicKeyResult.stack.readBigNumber();
+
+      onChainPublicKey =
+        BigInt(first)
+          .toString(16)
+          .padStart(64, "0");
+
+    } catch {
+
+      onChainPublicKey = null;
+    }
+
+
+    result.on_chain.get_public_key =
+      onChainPublicKey
+        ? "AVAILABLE"
+        : "AVAILABLE_BUT_NOT_PARSED";
+
+
+    // Never display the actual public key.
+    // Only compare it internally.
+
+    if (onChainPublicKey) {
+
+      const derivedPublicKey =
+        Buffer.from(
+          keyPair.publicKey
+        )
+          .toString("hex")
+          .toLowerCase();
+
+
+      result.on_chain.public_key_matches_mnemonic =
+        onChainPublicKey.toLowerCase() ===
+        derivedPublicKey;
+    }
+
+  } catch (error) {
+
+    result.on_chain.get_public_key =
+      "NOT_AVAILABLE_OR_NOT_STANDARD";
+
+    result.on_chain.get_public_key_error =
+      String(error?.message || error);
+  }
+
+
+  // --------------------------------------------------
+  // Read subwallet ID if available
+  // --------------------------------------------------
+
+  try {
+
+    const subwalletResult =
+      await client.runMethod(
+        senderAddress,
+        "get_subwallet_id"
+      );
+
+
+    let value = null;
+
+    try {
+
+      value =
+        subwalletResult.stack
+          .readBigNumber()
+          .toString();
+
+    } catch {
+
+      value = null;
+    }
+
+
+    result.on_chain.subwallet_id =
+      value;
+
+  } catch {
+
+    result.on_chain.subwallet_id =
+      "NOT_AVAILABLE_OR_NOT_STANDARD";
+  }
+
+
+  // --------------------------------------------------
+  // Final diagnosis
+  // --------------------------------------------------
+
+  const v4Match =
+    result.v4r2?.matches_sender === true;
+
+  const v5Match =
+    result.v5r1?.matches_sender === true;
+
+  const publicKeyMatch =
+    result.on_chain
+      ?.public_key_matches_mnemonic === true;
+
+
+  if (v4Match || v5Match) {
+
+    result.diagnosis =
+      "MNEMONIC_MATCHES_CONFIGURED_WALLET";
+
+  } else if (publicKeyMatch) {
+
+    result.diagnosis =
+      "MNEMONIC_PUBLIC_KEY_MATCHES_ON_CHAIN_WALLET_BUT_WALLET_CONTRACT_OR_WALLET_ID_IS_DIFFERENT";
+
+  } else if (
+    result.on_chain
+      ?.public_key_matches_mnemonic === false
+  ) {
+
+    result.diagnosis =
+      "MNEMONIC_DERIVES_A_DIFFERENT_PUBLIC_KEY_THAN_THE_CONFIGURED_SENDER";
+
+  } else {
+
+    result.diagnosis =
+      "MNEMONIC_DERIVATION_WORKED_BUT_WALLET_TYPE_OR_DERIVATION_SCHEME_IS_NOT_YET_IDENTIFIED";
+  }
+
+
+  result.safety =
+    "DIAGNOSTIC_ONLY. NO TRANSACTION WAS CREATED OR SENT.";
+
+
+  return result;
+}
+
+
+// ==================================================
+// TELEGRAM
+// ==================================================
+
+async function handleTelegramUpdate(env, update) {
+
+  const message =
+    update?.message;
+
+  if (!message) {
+    return;
+  }
+
+
+  const chatId =
+    String(message.chat?.id || "");
+
+  const userId =
+    String(message.from?.id || "");
+
+
+  if (userId !== ADMIN_TELEGRAM_ID) {
+    return;
+  }
+
+
+  const text =
+    String(message.text || "").trim();
+
+
+  // --------------------------------------------------
+  // START
+  // --------------------------------------------------
+
+  if (text === "/start") {
+
+    await sendMessage(
+      env,
+      chatId,
+
+      "PAYTON diagnostic bot.\n\n" +
+      "Send /diag to check the PTN sender wallet.\n\n" +
+      "No transaction will be sent."
+    );
+
+    return;
+  }
+
+
+  // --------------------------------------------------
+  // DIAGNOSTIC
+  // --------------------------------------------------
+
+  if (text === "/diag") {
+
+    await sendMessage(
+      env,
+      chatId,
+
+      "🔎 Running wallet diagnostic...\n\n" +
+      "No transaction will be sent."
+    );
+
+
+    try {
+
+      const result =
+        await runDiagnostic(env);
+
+
+      await sendMessage(
+        env,
+        chatId,
+
+        "🔎 DIAGNOSTIC RESULT\n\n" +
+        JSON.stringify(
+          result,
+          null,
+          2
+        )
+      );
+
+    } catch (error) {
+
+      await sendMessage(
+        env,
+        chatId,
+
+        "❌ Diagnostic failed.\n\n" +
+        String(
+          error?.message || error
+        )
+      );
+    }
+
+    return;
+  }
+
+
+  await sendMessage(
+    env,
+    chatId,
+
+    "Send /diag to run the sender-wallet diagnostic."
+  );
+}
+
+
+// ==================================================
+// WORKER
+// ==================================================
+
+export default {
+
+  async fetch(request, env) {
+
+    try {
+
+      // ----------------------------------------------
+      // GET
+      // ----------------------------------------------
+
+      if (request.method === "GET") {
+
+        const url =
+          new URL(request.url);
+
+
+        if (url.pathname === "/diag") {
+
+          if (!env.PTN_MNEMONIC) {
+
+            return json(
+              {
+                ok: false,
+                error:
+                  "PTN_MNEMONIC secret is missing."
+              },
+              500
+            );
+          }
+
+
+          const result =
+            await runDiagnostic(env);
+
+
+          return json(result);
+        }
+
+
+        return new Response(
+          "PAYTON diagnostic worker is running.",
+          {
+            status: 200
+          }
+        );
+      }
+
+
+      // ----------------------------------------------
+      // POST - Telegram webhook
+      // ----------------------------------------------
+
+      if (request.method === "POST") {
+
+        const update =
+          await request.json();
+
+
+        await handleTelegramUpdate(
+          env,
+          update
+        );
+
+
+        return new Response("OK");
+      }
+
+
+      return new Response(
+        "Method Not Allowed",
+        {
+          status: 405
+        }
+      );
+
+    } catch (error) {
+
+      return json(
+        {
+          ok: false,
+          error:
+            String(
+              error?.message || error
+            )
+        },
+        500
+      );
+    }
+  }
+};
