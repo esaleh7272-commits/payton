@@ -15,66 +15,19 @@ import {
   JettonWallet
 } from "@ton/ton";
 
+import {
+  mnemonicToPrivateKey,
+  mnemonicValidate
+} from "@ton/crypto";
+
 globalThis.Buffer = Buffer;
 
 
-/*
- * ==================================================
- * CLOUDFLARE WORKERS CACHE COMPATIBILITY
- * ==================================================
- *
- * Cloudflare Workers supports:
- *
- *   cache: "no-store"
- *   cache: "no-cache"
- *
- * Some HTTP libraries may explicitly create:
- *
- *   cache: "default"
- *
- * Cloudflare rejects that value.
- *
- * Convert only "default" to "no-store".
- */
-
-if (
-  typeof globalThis.Request !== "undefined" &&
-  !globalThis.__PAYTON_REQUEST_PATCHED__
-) {
-
-  const OriginalRequest =
-    globalThis.Request;
-
-  globalThis.Request =
-    class PaytonRequest extends OriginalRequest {
-
-      constructor(input, init) {
-
-        if (
-          init &&
-          init.cache === "default"
-        ) {
-
-          init = {
-            ...init,
-            cache: "no-store"
-          };
-        }
-
-        super(input, init);
-      }
-    };
-
-  globalThis.__PAYTON_REQUEST_PATCHED__ = true;
-}
-
-
-// ==================================================
+// ============================================================
 // CONFIG
-// ==================================================
+// ============================================================
 
-const ADMIN_TELEGRAM_ID =
-  "113074274";
+const ADMIN_TELEGRAM_ID = "113074274";
 
 const PTN_MASTER =
   "EQAZ_Rw9M91opByfYz1edG0TbeAKP72WcdccprkZvbvPVkAZ";
@@ -82,60 +35,179 @@ const PTN_MASTER =
 const PTN_SENDER_WALLET =
   "UQD9eW663lS-7SeGVyYK_cQlKBSjzWSbxaBkgUTigTjZ9Hh6";
 
-const PTN_DECIMALS =
-  9;
+const PTN_DECIMALS = 9;
 
 const TONCENTER_ENDPOINT =
   "https://toncenter.com/api/v2/jsonRPC";
 
-const JETTON_TRANSFER_VALUE =
-  toNano("0.05");
+const JETTON_TRANSFER_VALUE = toNano("0.05");
 
-const MIN_SENDER_TON =
-  toNano("0.10");
+const MIN_SENDER_TON = toNano("0.10");
 
 
-// ==================================================
-// ADMIN SESSIONS
-// ==================================================
+// ============================================================
+// CLOUDFLARE-SAFE AXIOS ADAPTER
+// ============================================================
+//
+// @ton/ton uses Axios internally.
+//
+// Axios 1.20.x can explicitly send:
+//
+//     cache: "default"
+//
+// Cloudflare Workers rejects that value.
+//
+// This adapter bypasses Axios' Fetch adapter and uses the
+// Cloudflare fetch API directly with:
+//
+//     cache: "no-store"
+//
+// ============================================================
 
-const sessions =
-  new Map();
+async function cloudflareFetchAdapter(config) {
+  const controller = new AbortController();
 
+  let timeoutId = null;
 
-// ==================================================
-// TELEGRAM
-// ==================================================
+  if (config.timeout && config.timeout > 0) {
+    timeoutId = setTimeout(() => {
+      controller.abort();
+    }, config.timeout);
+  }
 
-async function telegram(
-  env,
-  method,
-  body
-) {
+  try {
+    const headers = new Headers();
 
-  const url =
-    `https://api.telegram.org/bot${env.BOT_TOKEN}/${method}`;
-
-  const response =
-    await fetch(
-      url,
-      {
-        method: "POST",
-
-        headers: {
-          "content-type":
-            "application/json"
-        },
-
-        body:
-          JSON.stringify(body),
-
-        cache:
-          "no-store"
+    if (config.headers) {
+      if (typeof config.headers.forEach === "function") {
+        config.headers.forEach((value, key) => {
+          if (value !== undefined && value !== null) {
+            headers.set(key, String(value));
+          }
+        });
+      } else {
+        for (const [key, value] of Object.entries(config.headers)) {
+          if (value !== undefined && value !== null) {
+            headers.set(key, String(value));
+          }
+        }
       }
-    );
+    }
 
-  return response.json();
+    let body = config.data;
+
+    if (
+      body !== undefined &&
+      body !== null &&
+      typeof body !== "string"
+    ) {
+      body = JSON.stringify(body);
+    }
+
+    const method = String(config.method || "get").toUpperCase();
+
+    const response = await fetch(config.url, {
+      method,
+      headers,
+      body:
+        method === "GET" || method === "HEAD"
+          ? undefined
+          : body,
+      redirect: "follow",
+      cache: "no-store",
+      signal: controller.signal
+    });
+
+    const text = await response.text();
+
+    let data;
+
+    try {
+      data = text ? JSON.parse(text) : null;
+    } catch {
+      data = text;
+    }
+
+    const responseHeaders = {};
+
+    response.headers.forEach((value, key) => {
+      responseHeaders[key] = value;
+    });
+
+    if (!response.ok) {
+      throw new Error(
+        `TON API HTTP ${response.status}: ${
+          typeof data === "string"
+            ? data
+            : JSON.stringify(data)
+        }`
+      );
+    }
+
+    return {
+      data,
+      status: response.status,
+      statusText: response.statusText,
+      headers: responseHeaders,
+      config,
+      request: null
+    };
+  } catch (error) {
+    if (error?.name === "AbortError") {
+      throw new Error("TON API request timed out.");
+    }
+
+    throw error;
+  } finally {
+    if (timeoutId !== null) {
+      clearTimeout(timeoutId);
+    }
+  }
+}
+
+
+// ============================================================
+// TON CLIENT
+// ============================================================
+
+function createTonClient(env) {
+  return new TonClient({
+    endpoint: TONCENTER_ENDPOINT,
+    apiKey: env.TONCENTER_API_KEY,
+    timeout: 30000,
+    httpAdapter: cloudflareFetchAdapter
+  });
+}
+
+
+// ============================================================
+// TELEGRAM
+// ============================================================
+
+async function telegram(env, method, body) {
+  const response = await fetch(
+    `https://api.telegram.org/bot${env.BOT_TOKEN}/${method}`,
+    {
+      method: "POST",
+      headers: {
+        "content-type": "application/json"
+      },
+      cache: "no-store",
+      body: JSON.stringify(body)
+    }
+  );
+
+  const data = await response.json();
+
+  if (!data.ok) {
+    throw new Error(
+      `Telegram API error: ${
+        data.description || "Unknown error"
+      }`
+    );
+  }
+
+  return data.result;
 }
 
 
@@ -143,851 +215,501 @@ async function sendMessage(
   env,
   chatId,
   text,
-  keyboard = null
+  extra = {}
 ) {
-
-  const body = {
-    chat_id:
-      chatId,
-
-    text:
-      text
-  };
-
-  if (keyboard) {
-
-    body.reply_markup =
-      keyboard;
-  }
-
-  return telegram(
-    env,
-    "sendMessage",
-    body
-  );
-}
-
-
-async function answerCallback(
-  env,
-  callbackId
-) {
-
-  return telegram(
-    env,
-    "answerCallbackQuery",
-    {
-      callback_query_id:
-        callbackId
-    }
-  );
-}
-
-
-// ==================================================
-// KEYBOARDS
-// ==================================================
-
-function mainKeyboard() {
-
-  return {
-
-    inline_keyboard: [
-
-      [
-        {
-          text:
-            "💸 Manual PTN Payment",
-
-          callback_data:
-            "manual_ptn"
-        }
-      ]
-
-    ]
-  };
-}
-
-
-function cancelKeyboard() {
-
-  return {
-
-    inline_keyboard: [
-
-      [
-        {
-          text:
-            "❌ Cancel",
-
-          callback_data:
-            "cancel_payment"
-        }
-      ]
-
-    ]
-  };
-}
-
-
-// ==================================================
-// MNEMONIC
-// ==================================================
-
-function normalizeMnemonic(
-  raw
-) {
-
-  return String(raw || "")
-    .trim()
-    .replace(/\s+/g, " ")
-    .split(" ")
-    .filter(Boolean);
-}
-
-
-// ==================================================
-// PTN AMOUNT
-// ==================================================
-
-function parsePtnAmount(
-  value
-) {
-
-  const input =
-    String(value || "")
-      .trim()
-      .replace(/,/g, "");
-
-  if (!input) {
-
-    throw new Error(
-      "PTN amount is required."
-    );
-  }
-
-
-  if (
-    !/^\d+(\.\d{1,9})?$/.test(
-      input
-    )
-  ) {
-
-    throw new Error(
-      "Invalid PTN amount. Use numbers with up to 9 decimal places."
-    );
-  }
-
-
-  const parts =
-    input.split(".");
-
-  const whole =
-    parts[0];
-
-  const fraction =
-    parts[1] || "";
-
-  const padded =
-    fraction.padEnd(
-      PTN_DECIMALS,
-      "0"
-    );
-
-  const amount =
-    BigInt(
-      whole + padded
-    );
-
-
-  if (
-    amount <= 0n
-  ) {
-
-    throw new Error(
-      "PTN amount must be greater than zero."
-    );
-  }
-
-
-  return {
-
-    display:
-      input,
-
-    nano:
-      amount
-  };
-}
-
-
-// ==================================================
-// DESTINATION ADDRESS
-// ==================================================
-
-function parseDestination(
-  value
-) {
-
-  const input =
-    String(value || "")
-      .trim();
-
-  if (!input) {
-
-    throw new Error(
-      "Wallet address is required."
-    );
-  }
-
-
-  /*
-   * IMPORTANT:
-   *
-   * Destination is ONLY a TON Address.
-   *
-   * No V4/V5 detection.
-   */
-
-  return Address.parse(
-    input
-  );
-}
-
-
-// ==================================================
-// TON CLIENT
-// ==================================================
-
-function createClient(
-  env
-) {
-
-  return new TonClient({
-
-    endpoint:
-      TONCENTER_ENDPOINT,
-
-    apiKey:
-      env.TONCENTER_API_KEY
+  return telegram(env, "sendMessage", {
+    chat_id: chatId,
+    text,
+    ...extra
   });
 }
 
 
-// ==================================================
-// CREATE V5R1 SENDER
-// ==================================================
+// ============================================================
+// SESSION
+// ============================================================
 
-async function createSenderWallet(
-  env
-) {
+const sessions = new Map();
 
-  if (!env.PTN_MNEMONIC) {
+function getSession(userId) {
+  return sessions.get(String(userId)) || null;
+}
 
+function setSession(userId, value) {
+  sessions.set(String(userId), value);
+}
+
+function clearSession(userId) {
+  sessions.delete(String(userId));
+}
+
+
+// ============================================================
+// ADMIN CHECK
+// ============================================================
+
+function isAdmin(userId) {
+  return String(userId) === ADMIN_TELEGRAM_ID;
+}
+
+
+// ============================================================
+// ADDRESS
+// ============================================================
+//
+// Destination is ONLY a TON MsgAddress.
+//
+// No V4/V5 detection is performed here.
+// V4/V5 matters only for the sender wallet contract.
+//
+
+function parseDestination(value) {
+  const input = String(value || "").trim();
+
+  if (!input) {
+    throw new Error("Wallet address is required.");
+  }
+
+  return Address.parse(input);
+}
+
+
+// ============================================================
+// PTN AMOUNT
+// ============================================================
+
+function parsePtnAmount(value) {
+  const input = String(value || "")
+    .trim()
+    .replace(/,/g, "");
+
+  if (!/^\d+(\.\d{1,9})?$/.test(input)) {
     throw new Error(
-      "PTN_MNEMONIC secret is missing."
+      "Invalid PTN amount. Maximum 9 decimal places are allowed."
     );
   }
 
+  const [whole, fraction = ""] = input.split(".");
 
-  const words =
-    normalizeMnemonic(
-      env.PTN_MNEMONIC
-    );
+  const fractionPadded = fraction
+    .padEnd(PTN_DECIMALS, "0");
 
+  const nanoString =
+    whole + fractionPadded;
 
-  if (
-    words.length !== 12 &&
-    words.length !== 24
-  ) {
+  const amount = BigInt(nanoString);
 
-    throw new Error(
-      "Invalid mnemonic word count."
-    );
+  if (amount <= 0n) {
+    throw new Error("PTN amount must be greater than zero.");
   }
-
-
-  if (
-    typeof globalThis.window ===
-    "undefined"
-  ) {
-
-    globalThis.window =
-      globalThis;
-  }
-
-
-  const cryptoModule =
-    await import(
-      "@ton/crypto"
-    );
-
-
-  const mnemonicValid =
-    await cryptoModule.mnemonicValidate(
-      words
-    );
-
-
-  if (!mnemonicValid) {
-
-    throw new Error(
-      "The configured mnemonic is not a valid TON mnemonic."
-    );
-  }
-
-
-  const keyPair =
-    await cryptoModule.mnemonicToPrivateKey(
-      words
-    );
-
-
-  /*
-   * Confirmed wallet type:
-   *
-   * V5R1
-   *
-   * Mainnet:
-   *
-   * networkGlobalId = -239
-   */
-
-  const wallet =
-    WalletContractV5R1.create({
-
-      workchain:
-        0,
-
-      publicKey:
-        keyPair.publicKey,
-
-      walletId: {
-
-        networkGlobalId:
-          -239
-      }
-    });
-
-
-  /*
-   * SAFETY CHECK
-   *
-   * Never sign if the mnemonic produces
-   * a different sender wallet.
-   */
-
-  const configured =
-    Address.parse(
-      PTN_SENDER_WALLET
-    );
-
-
-  if (
-    !wallet.address.equals(
-      configured
-    )
-  ) {
-
-    throw new Error(
-      "The mnemonic does not derive the configured PTN sender wallet. No transaction was sent."
-    );
-  }
-
 
   return {
-
-    wallet:
-      wallet,
-
-    keyPair:
-      keyPair
+    nano: amount,
+    display: input
   };
 }
 
 
-// ==================================================
-// CHECK TON BALANCE
-// ==================================================
+// ============================================================
+// V5R1 SENDER WALLET
+// ============================================================
 
-async function checkTonBalance(
-  client,
-  wallet
-) {
+async function createSenderWallet(env) {
+  const mnemonic = String(
+    env.PTN_MNEMONIC || ""
+  ).trim();
 
-  const balance =
-    await client.getBalance(
-      wallet.address
-    );
-
-
-  if (
-    balance <
-    MIN_SENDER_TON
-  ) {
-
+  if (!mnemonic) {
     throw new Error(
-      `Insufficient TON balance for network fees. Current balance: ${Number(balance) / 1e9} TON.`
+      "PTN_MNEMONIC secret is not configured."
     );
   }
 
+  const words = mnemonic
+    .split(/\s+/)
+    .filter(Boolean);
 
-  return balance;
+  if (!mnemonicValidate(words)) {
+    throw new Error(
+      "The configured PTN mnemonic is invalid."
+    );
+  }
+
+  const keyPair =
+    await mnemonicToPrivateKey(words);
+
+  const wallet =
+    WalletContractV5R1.create({
+      workchain: 0,
+      publicKey: keyPair.publicKey,
+      walletId: {
+        networkGlobalId: -239
+      }
+    });
+
+  const configured =
+    Address.parse(PTN_SENDER_WALLET);
+
+  if (!wallet.address.equals(configured)) {
+    throw new Error(
+      "The configured mnemonic does not match the PTN sender wallet."
+    );
+  }
+
+  return {
+    wallet,
+    keyPair
+  };
 }
 
 
-// ==================================================
+// ============================================================
 // PTN JETTON WALLET
-// ==================================================
+// ============================================================
 
 async function getPtnJettonWallet(
   client,
   senderAddress
 ) {
-
   const master =
     client.open(
-
       JettonMaster.create(
-
-        Address.parse(
-          PTN_MASTER
-        )
-
+        Address.parse(PTN_MASTER)
       )
-
     );
-
 
   const jettonWalletAddress =
     await master.getWalletAddress(
       senderAddress
     );
 
-
   return client.open(
-
     JettonWallet.create(
       jettonWalletAddress
     )
-
   );
 }
 
 
-// ==================================================
-// CHECK PTN BALANCE
-// ==================================================
-
-async function checkPtnBalance(
-  jettonWallet,
-  requiredAmount
-) {
-
-  const balance =
-    await jettonWallet.getBalance();
-
-
-  if (
-    balance <
-    requiredAmount
-  ) {
-
-    const human =
-      Number(balance) /
-      10 ** PTN_DECIMALS;
-
-
-    throw new Error(
-      `Insufficient PTN balance. Available: ${human} PTN.`
-    );
-  }
-
-
-  return balance;
-}
-
-
-// ==================================================
+// ============================================================
 // SEND PTN
-// ==================================================
+// ============================================================
 
 async function sendPtn(
   env,
   destination,
-  amount
+  ptnAmount
 ) {
+  const client = createTonClient(env);
 
-  const client =
-    createClient(
-      env
-    );
-
-
-  // ----------------------------------------------
-  // Sender
-  // ----------------------------------------------
+  // ----------------------------------------------------------
+  // Create and verify V5R1 sender
+  // ----------------------------------------------------------
 
   const {
     wallet,
     keyPair
-  } =
-    await createSenderWallet(
-      env
+  } = await createSenderWallet(env);
+
+  // ----------------------------------------------------------
+  // Verify sender address
+  // ----------------------------------------------------------
+
+  if (
+    !wallet.address.equals(
+      Address.parse(PTN_SENDER_WALLET)
+    )
+  ) {
+    throw new Error(
+      "Sender wallet safety check failed."
     );
+  }
 
+  // ----------------------------------------------------------
+  // Open sender wallet
+  // ----------------------------------------------------------
 
-  // ----------------------------------------------
-  // TON balance
-  // ----------------------------------------------
+  const senderContract =
+    client.open(wallet);
+
+  // ----------------------------------------------------------
+  // Check TON balance
+  // ----------------------------------------------------------
 
   const tonBalance =
-    await checkTonBalance(
-      client,
-      wallet
+    await senderContract.getBalance();
+
+  if (tonBalance < MIN_SENDER_TON) {
+    throw new Error(
+      "Insufficient TON balance for network fees."
     );
+  }
 
+  // ----------------------------------------------------------
+  // Find sender PTN Jetton wallet
+  // ----------------------------------------------------------
 
-  // ----------------------------------------------
-  // PTN Jetton Wallet
-  // ----------------------------------------------
-
-  const ptnWallet =
+  const jettonWallet =
     await getPtnJettonWallet(
       client,
       wallet.address
     );
 
-
-  // ----------------------------------------------
-  // PTN balance
-  // ----------------------------------------------
+  // ----------------------------------------------------------
+  // Check PTN balance
+  // ----------------------------------------------------------
 
   const ptnBalance =
-    await checkPtnBalance(
-      ptnWallet,
-      amount.nano
+    await jettonWallet.getBalance();
+
+  if (ptnBalance < ptnAmount.nano) {
+    const available =
+      Number(ptnBalance) /
+      10 ** PTN_DECIMALS;
+
+    throw new Error(
+      `Insufficient PTN balance. Available: ${available} PTN.`
     );
+  }
 
-
-  // ----------------------------------------------
-  // Query ID
-  // ----------------------------------------------
+  // ----------------------------------------------------------
+  // Create Jetton transfer payload
+  // ----------------------------------------------------------
 
   const queryId =
-    BigInt(
-      Date.now()
-    );
+    BigInt(Date.now());
 
-
-  // ----------------------------------------------
-  // Jetton transfer body
-  // ----------------------------------------------
-
-  const body =
+  const transferBody =
     beginCell()
-
       .storeUint(
         0x0f8a7ea5,
         32
       )
-
       .storeUint(
         queryId,
         64
       )
-
       .storeCoins(
-        amount.nano
+        ptnAmount.nano
       )
-
-      /*
-       * Destination only.
-       * No V4/V5 detection.
-       */
-
       .storeAddress(
         destination
       )
-
-      /*
-       * Response/refund address.
-       */
-
       .storeAddress(
         wallet.address
       )
-
-      /*
-       * No custom payload.
-       */
-
       .storeBit(0)
-
-      /*
-       * Forward TON amount.
-       */
-
       .storeCoins(
         toNano("0.01")
       )
-
-      /*
-       * No forward payload.
-       */
-
       .storeBit(0)
-
       .endCell();
 
-
-  // ----------------------------------------------
-  // Internal message to PTN Jetton Wallet
-  // ----------------------------------------------
-
-  const message =
-    internal({
-
-      to:
-        ptnWallet.address,
-
-      value:
-        JETTON_TRANSFER_VALUE,
-
-      bounce:
-        true,
-
-      body:
-        body
-    });
-
-
-  // ----------------------------------------------
-  // Open V5R1 wallet
-  // ----------------------------------------------
-
-  const senderContract =
-    client.open(
-      wallet
-    );
-
-
-  // ----------------------------------------------
-  // Current seqno
-  // ----------------------------------------------
+  // ----------------------------------------------------------
+  // Get current seqno
+  // ----------------------------------------------------------
 
   const seqno =
     await senderContract.getSeqno();
 
-
-  // ----------------------------------------------
-  // SEND
-  // ----------------------------------------------
+  // ----------------------------------------------------------
+  // Send V5R1 transaction
+  // ----------------------------------------------------------
 
   await senderContract.sendTransfer({
-
-    seqno:
-      seqno,
+    seqno,
 
     secretKey:
       keyPair.secretKey,
 
-    messages: [
-      message
-    ],
-
     sendMode:
       SendMode.PAY_GAS_SEPARATELY,
 
-    timeout:
-      Math.floor(
-        Date.now() / 1000
-      ) + 300
+    messages: [
+      internal({
+        to: jettonWallet.address,
+
+        value:
+          JETTON_TRANSFER_VALUE,
+
+        body:
+          transferBody
+      })
+    ]
   });
 
-
   return {
-
-    sender:
-      wallet.address.toString({
-        bounceable:
-          true,
-
-        urlSafe:
-          true
-      }),
-
-    jettonWallet:
-      ptnWallet.address.toString({
-        bounceable:
-          true,
-
-        urlSafe:
-          true
-      }),
+    sender: wallet.address.toString({
+      bounceable: false,
+      urlSafe: true
+    }),
 
     destination:
       destination.toString({
-        bounceable:
-          true,
-
-        urlSafe:
-          true
+        bounceable: false,
+        urlSafe: true
       }),
 
-    ptnAmount:
-      amount.display,
+    amount:
+      ptnAmount.display,
 
-    ptnAmountNano:
-      amount.nano.toString(),
-
-    queryId:
-      queryId.toString(),
-
-    seqno:
-      seqno,
-
-    tonBalance:
-      tonBalance.toString(),
-
-    ptnBalance:
-      ptnBalance.toString()
+    seqno
   };
 }
 
 
-// ==================================================
-// MAIN MENU
-// ==================================================
+// ============================================================
+// START MENU
+// ============================================================
 
-async function showMainMenu(
+async function showMenu(
   env,
   chatId
 ) {
-
-  await sendMessage(
-
+  return sendMessage(
     env,
     chatId,
-
     "PAYTON PTN Sender\n\nChoose an action:",
-
-    mainKeyboard()
+    {
+      reply_markup: {
+        inline_keyboard: [
+          [
+            {
+              text: "💸 Manual PTN Payment",
+              callback_data: "manual_ptn"
+            }
+          ]
+        ]
+      }
+    }
   );
 }
 
 
-// ==================================================
-// CALLBACK HANDLER
-// ==================================================
+// ============================================================
+// HANDLE CALLBACK
+// ============================================================
 
 async function handleCallback(
   env,
   callback
 ) {
+  const data =
+    callback.data || "";
 
-  const callbackId =
-    callback.id;
-
-  const fromId =
-    String(
-      callback.from?.id || ""
-    );
+  const userId =
+    callback.from?.id;
 
   const chatId =
-    String(
-      callback.message?.chat?.id || ""
-    );
+    callback.message?.chat?.id;
 
-  const data =
-    callback.data;
-
-
-  if (
-    fromId !==
-    ADMIN_TELEGRAM_ID
-  ) {
-
-    await answerCallback(
-      env,
-      callbackId
-    );
-
+  if (!isAdmin(userId)) {
     return;
   }
 
-
-  await answerCallback(
+  await telegram(
     env,
-    callbackId
+    "answerCallbackQuery",
+    {
+      callback_query_id:
+        callback.id
+    }
   );
 
-
-  // ----------------------------------------------
-  // Manual PTN
-  // ----------------------------------------------
-
-  if (
-    data ===
-    "manual_ptn"
-  ) {
-
-    sessions.set(
-
-      chatId,
-
-      {
-        step:
-          "destination"
-      }
-
-    );
-
+  if (data === "manual_ptn") {
+    setSession(userId, {
+      step: "destination"
+    });
 
     await sendMessage(
-
       env,
       chatId,
-
-      "💸 Manual PTN Payment\n\n" +
-
-      "Send the destination TON wallet address.\n\n" +
-
-      "The destination is treated only as a TON address.\n" +
-
-      "V4/V5 detection is not used.",
-
-      cancelKeyboard()
+      "Enter the destination TON wallet address:"
     );
 
     return;
   }
 
+  if (data === "confirm_send") {
+    const session =
+      getSession(userId);
 
-  // ----------------------------------------------
-  // Cancel
-  // ----------------------------------------------
+    if (
+      !session ||
+      session.step !== "confirm"
+    ) {
+      await sendMessage(
+        env,
+        chatId,
+        "This payment session has expired. Please start again."
+      );
 
-  if (
-    data ===
-    "cancel_payment"
-  ) {
+      return;
+    }
 
-    sessions.delete(
-      chatId
-    );
+    const statusMessage =
+      await sendMessage(
+        env,
+        chatId,
+        "⏳ Checking sender wallet, PTN balance and network fee..."
+      );
 
+    try {
+      const result =
+        await sendPtn(
+          env,
+          session.destination,
+          session.amount
+        );
+
+      clearSession(userId);
+
+      await sendMessage(
+        env,
+        chatId,
+        [
+          "✅ PTN transfer submitted successfully.",
+          "",
+          `Amount: ${result.amount} PTN`,
+          `Destination: ${result.destination}`,
+          `Seqno: ${result.seqno}`,
+          "",
+          "The transaction has been sent to the TON network."
+        ].join("\n")
+      );
+    } catch (error) {
+      console.error(
+        "PTN transfer failed:",
+        error
+      );
+
+      await sendMessage(
+        env,
+        chatId,
+        [
+          "❌ PTN transfer failed.",
+          "",
+          error?.message ||
+            "Unknown transfer error.",
+          "",
+          "No successful PTN transfer was confirmed by this bot."
+        ].join("\n")
+      );
+    }
+
+    return;
+  }
+
+  if (data === "cancel_send") {
+    clearSession(userId);
 
     await sendMessage(
-
       env,
       chatId,
-
       "❌ Payment cancelled."
     );
 
-
-    await showMainMenu(
+    await showMenu(
       env,
       chatId
     );
@@ -997,140 +719,44 @@ async function handleCallback(
 }
 
 
-// ==================================================
-// MESSAGE HANDLER
-// ==================================================
+// ============================================================
+// HANDLE MESSAGE
+// ============================================================
 
 async function handleMessage(
   env,
   message
 ) {
-
   const userId =
-    String(
-      message.from?.id || ""
-    );
+    message.from?.id;
 
   const chatId =
-    String(
-      message.chat?.id || ""
-    );
+    message.chat?.id;
 
   const text =
-    String(
-      message.text || ""
-    ).trim();
+    String(message.text || "")
+      .trim();
 
-
-  // ----------------------------------------------
-  // ADMIN ONLY
-  // ----------------------------------------------
-
-  if (
-    userId !==
-    ADMIN_TELEGRAM_ID
-  ) {
-
+  if (!isAdmin(userId)) {
     return;
   }
 
+  if (text === "/start") {
+    clearSession(userId);
 
-  // ----------------------------------------------
-  // START
-  // ----------------------------------------------
-
-  if (
-    text ===
-    "/start"
-  ) {
-
-    sessions.delete(
-      chatId
-    );
-
-
-    await sendMessage(
-
-      env,
-      chatId,
-
-      "PAYTON PTN Sender",
-
-      mainKeyboard()
-    );
-
-    return;
-  }
-
-
-  // ----------------------------------------------
-  // CANCEL
-  // ----------------------------------------------
-
-  if (
-    text ===
-    "/cancel"
-  ) {
-
-    sessions.delete(
-      chatId
-    );
-
-
-    await sendMessage(
-
-      env,
-      chatId,
-
-      "❌ Payment cancelled."
-    );
-
-
-    await showMainMenu(
+    await showMenu(
       env,
       chatId
     );
 
     return;
   }
-
-
-  // ----------------------------------------------
-  // MENU
-  // ----------------------------------------------
-
-  if (
-    text ===
-    "/menu"
-  ) {
-
-    sessions.delete(
-      chatId
-    );
-
-
-    await showMainMenu(
-      env,
-      chatId
-    );
-
-    return;
-  }
-
-
-  // ----------------------------------------------
-  // SESSION
-  // ----------------------------------------------
 
   const session =
-    sessions.get(
-      chatId
-    );
-
+    getSession(userId);
 
   if (!session) {
-
-    await showMainMenu(
+    await showMenu(
       env,
       chatId
     );
@@ -1138,500 +764,165 @@ async function handleMessage(
     return;
   }
 
-
-  // ----------------------------------------------
-  // DESTINATION
-  // ----------------------------------------------
+  // ----------------------------------------------------------
+  // Destination
+  // ----------------------------------------------------------
 
   if (
     session.step ===
     "destination"
   ) {
-
     try {
-
       const destination =
-        parseDestination(
-          text
-        );
+        parseDestination(text);
 
-
-      session.destination =
-        destination.toString({
-
-          bounceable:
-            true,
-
-          urlSafe:
-            true
-        });
-
-
-      session.step =
-        "amount";
-
-
-      sessions.set(
-        chatId,
-        session
-      );
-
+      setSession(userId, {
+        step: "amount",
+        destination
+      });
 
       await sendMessage(
-
         env,
         chatId,
-
-        "✅ Destination accepted.\n\n" +
-
-        "Now send the PTN amount.\n\n" +
-
-        "Example: 1000\n" +
-
-        "Maximum 9 decimal places.\n\n" +
-
-        "Send /cancel to cancel.",
-
-        cancelKeyboard()
+        "Enter the PTN amount to send:"
       );
-
-    } catch {
-
+    } catch (error) {
       await sendMessage(
-
         env,
         chatId,
-
-        "❌ Invalid TON wallet address.\n\n" +
-
-        "Please send a valid TON address or /cancel."
+        `❌ ${error.message}\n\nPlease enter a valid TON wallet address.`
       );
     }
 
     return;
   }
 
-
-  // ----------------------------------------------
-  // AMOUNT
-  // ----------------------------------------------
+  // ----------------------------------------------------------
+  // Amount
+  // ----------------------------------------------------------
 
   if (
     session.step ===
     "amount"
   ) {
-
-    let amount;
-
     try {
+      const amount =
+        parsePtnAmount(text);
 
-      amount =
-        parsePtnAmount(
-          text
-        );
+      setSession(userId, {
+        step: "confirm",
+        destination:
+          session.destination,
+        amount
+      });
 
-    } catch (error) {
+      const destinationText =
+        session.destination.toString({
+          bounceable: false,
+          urlSafe: true
+        });
 
       await sendMessage(
-
         env,
         chatId,
-
-        "❌ " +
-        String(
-          error?.message ||
-          error
-        )
-      );
-
-      return;
-    }
-
-
-    session.amount =
-      amount.display;
-
-    session.step =
-      "confirm";
-
-
-    sessions.set(
-      chatId,
-      session
-    );
-
-
-    await sendMessage(
-
-      env,
-      chatId,
-
-      "⚠️ Confirm PTN transfer\n\n" +
-
-      "Destination:\n" +
-
-      session.destination +
-
-      "\n\n" +
-
-      "PTN amount:\n" +
-
-      amount.display +
-
-      " PTN\n\n" +
-
-      "Press Confirm to send the transaction.",
-
-      {
-
-        inline_keyboard: [
-
-          [
-            {
-              text:
-                "✅ Confirm & Send",
-
-              callback_data:
-                "confirm_ptn"
-            }
-          ],
-
-          [
-            {
-              text:
-                "❌ Cancel",
-
-              callback_data:
-                "cancel_payment"
-            }
-          ]
-
-        ]
-      }
-    );
-
-    return;
-  }
-}
-
-
-// ==================================================
-// CONFIRM
-// ==================================================
-
-async function handleConfirm(
-  env,
-  callback
-) {
-
-  const fromId =
-    String(
-      callback.from?.id || ""
-    );
-
-  const chatId =
-    String(
-      callback.message?.chat?.id || ""
-    );
-
-
-  if (
-    fromId !==
-    ADMIN_TELEGRAM_ID
-  ) {
-
-    await answerCallback(
-      env,
-      callback.id
-    );
-
-    return;
-  }
-
-
-  await answerCallback(
-    env,
-    callback.id
-  );
-
-
-  const session =
-    sessions.get(
-      chatId
-    );
-
-
-  if (
-    !session ||
-    session.step !==
-    "confirm"
-  ) {
-
-    await sendMessage(
-
-      env,
-      chatId,
-
-      "❌ Payment session expired. Please start again."
-    );
-
-    return;
-  }
-
-
-  /*
-   * Delete BEFORE sending.
-   */
-
-  sessions.delete(
-    chatId
-  );
-
-
-  await sendMessage(
-
-    env,
-    chatId,
-
-    "⏳ Checking sender wallet, PTN balance and network fee..."
-  );
-
-
-  try {
-
-    const destination =
-      parseDestination(
-        session.destination
-      );
-
-
-    const amount =
-      parsePtnAmount(
-        session.amount
-      );
-
-
-    const result =
-      await sendPtn(
-
-        env,
-        destination,
-        amount
-      );
-
-
-    await sendMessage(
-
-      env,
-      chatId,
-
-      "✅ PTN transfer submitted.\n\n" +
-
-      "Amount: " +
-      result.ptnAmount +
-      " PTN\n\n" +
-
-      "Destination:\n" +
-      result.destination +
-      "\n\n" +
-
-      "Sender:\n" +
-      result.sender +
-      "\n\n" +
-
-      "Seqno: " +
-      result.seqno +
-      "\n\n" +
-
-      "The transaction has been submitted to the TON network."
-    );
-
-
-    await showMainMenu(
-      env,
-      chatId
-    );
-
-  } catch (error) {
-
-    await sendMessage(
-
-      env,
-      chatId,
-
-      "❌ PTN transfer failed.\n\n" +
-
-      String(
-        error?.message ||
-        error
-      ) +
-
-      "\n\n" +
-
-      "No successful PTN transfer was confirmed by this bot."
-    );
-
-
-    await showMainMenu(
-      env,
-      chatId
-    );
-  }
-}
-
-
-// ==================================================
-// UPDATE HANDLER
-// ==================================================
-
-async function handleTelegramUpdate(
-  env,
-  update
-) {
-
-  if (
-    update?.callback_query
-  ) {
-
-    const callback =
-      update.callback_query;
-
-
-    if (
-      callback.data ===
-      "confirm_ptn"
-    ) {
-
-      await handleConfirm(
-        env,
-        callback
-      );
-
-      return;
-    }
-
-
-    await handleCallback(
-      env,
-      callback
-    );
-
-    return;
-  }
-
-
-  if (
-    update?.message
-  ) {
-
-    await handleMessage(
-      env,
-      update.message
-    );
-  }
-}
-
-
-// ==================================================
-// WORKER
-// ==================================================
-
-export default {
-
-  async fetch(
-    request,
-    env
-  ) {
-
-    try {
-
-      if (
-        request.method ===
-        "GET"
-      ) {
-
-        return new Response(
-
-          "PAYTON PTN Sender is running.",
-
-          {
-            status:
-              200,
-
-            headers: {
-              "cache-control":
-                "no-store"
-            }
-          }
-        );
-      }
-
-
-      if (
-        request.method ===
-        "POST"
-      ) {
-
-        const update =
-          await request.json();
-
-
-        await handleTelegramUpdate(
-          env,
-          update
-        );
-
-
-        return new Response(
-          "OK",
-          {
-            status:
-              200,
-
-            headers: {
-              "cache-control":
-                "no-store"
-            }
-          }
-        );
-      }
-
-
-      return new Response(
-
-        "Method Not Allowed",
-
+        [
+          "Confirm PTN payment:",
+          "",
+          `Destination: ${destinationText}`,
+          `PTN amount: ${amount.display} PTN`,
+          "",
+          "The PTN will be sent from the configured PAYTON sender wallet."
+        ].join("\n"),
         {
-          status:
-            405
+          reply_markup: {
+            inline_keyboard: [
+              [
+                {
+                  text: "✅ Confirm & Send",
+                  callback_data:
+                    "confirm_send"
+                }
+              ],
+              [
+                {
+                  text: "❌ Cancel",
+                  callback_data:
+                    "cancel_send"
+                }
+              ]
+            ]
+          }
         }
       );
-
     } catch (error) {
+      await sendMessage(
+        env,
+        chatId,
+        `❌ ${error.message}\n\nEnter the PTN amount again.`
+      );
+    }
+
+    return;
+  }
+}
+
+
+// ============================================================
+// MAIN WORKER
+// ============================================================
+
+export default {
+  async fetch(request, env) {
+    try {
+      if (request.method !== "POST") {
+        return new Response(
+          "PAYTON PTN Sender is running.",
+          {
+            status: 200,
+            headers: {
+              "cache-control":
+                "no-store"
+            }
+          }
+        );
+      }
+
+      const update =
+        await request.json();
+
+      if (update.callback_query) {
+        await handleCallback(
+          env,
+          update.callback_query
+        );
+      } else if (update.message) {
+        await handleMessage(
+          env,
+          update.message
+        );
+      }
 
       return new Response(
-
-        JSON.stringify({
-
-          ok:
-            false,
-
-          error:
-            String(
-              error?.message ||
-              error
-            )
-
-        }),
-
+        "OK",
         {
-          status:
-            500,
-
+          status: 200,
           headers: {
-            "content-type":
-              "application/json",
+            "cache-control":
+              "no-store"
+          }
+        }
+      );
+    } catch (error) {
+      console.error(
+        "Worker error:",
+        error
+      );
 
+      return new Response(
+        "OK",
+        {
+          status: 200,
+          headers: {
             "cache-control":
               "no-store"
           }
