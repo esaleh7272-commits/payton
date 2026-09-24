@@ -7,3912 +7,486 @@ import {
   toNano,
   Cell
 } from "@ton/core";
-
 import {
   TonClient,
   WalletContractV5R1,
   JettonMaster
 } from "@ton/ton";
-
-import {
-  mnemonicToPrivateKey
-} from "@ton/crypto";
+import { mnemonicToPrivateKey } from "@ton/crypto";
 
 globalThis.Buffer = Buffer;
 
-/* =========================================================
-   PAYTON CONFIG
-========================================================= */
-
-const WELCOME = `🦊 Welcome to PAYTON (PTN)
-
-Welcome to the official PAYTON presale.
-
-💰 Payment: GRAM
-
-Presale Price: 1,000,000 PTN = 1 GRAM
-
-Choose an option below:`;
-
-const MENU = {
-  inline_keyboard: [
-    [{ text: "🪙 Buy PTN", callback_data: "buy" }],
-    [{ text: "💰 Price", callback_data: "price" }],
-    [{ text: "📋 My Orders", callback_data: "orders" }],
-    [{ text: "💬 Support", callback_data: "support" }]
-  ]
-};
-
-const BACK = {
-  inline_keyboard: [
-    [{ text: "⬅️ Back", callback_data: "home" }]
-  ]
-};
-
-const ADMIN_TELEGRAM_ID = "113074274";
-
-const ADMIN_BACK = {
-  inline_keyboard: [
-    [{ text: "⬅️ Admin Panel", callback_data: "admin_home" }]
-  ]
-};
-
-/* =========================================================
-   TOKEN / WALLET CONFIG
-========================================================= */
-
-const PTN_MASTER =
-  "EQAZ_Rw9M91opByfYz1edG0TbeAKP72WcdccprkZvbvPVkAZ";
-
-const PTN_SENDER_WALLET =
-  "UQD9eW663lS-7SeGVyYK_cQlKBSjzWSbxaBkgUTigTjZ9Hh6";
-
-const GRAM_RECEIVING_WALLET =
-  "UQB9E73FFG6ql1XwXjt5XXBXi0Xss6zWh1xaJcow1HWaE4IT";
+const MAINNET_NETWORK_ID = -239;
 
 const PTN_DECIMALS = 9;
 const PTN_PER_GRAM = 1000000n;
 
-const MIN_SENDER_TON_BALANCE =
-  toNano("0.20");
+const PAYMENT_LOOKBACK_LIMIT = 100;
+const ORDER_BATCH_SIZE = 20;
 
-const PAYOUT_MESSAGE_VALUE =
-  toNano("0.10");
+const PAYOUT_TON_AMOUNT = "0.10";
+const FORWARD_TON_AMOUNT = 1n;
 
-const PAYOUT_FORWARD_TON_AMOUNT =
-  toNano("0.05");
-
-/* =========================================================
-   SUPPORT QUICK REPLIES
-========================================================= */
-
-const QUICK_REPLIES = [
-  "⏳ Please wait while your transaction is being verified.",
-  "🔍 Your transaction is currently under review.",
-  "✅ Your payment has been verified successfully.",
-  "❌ We could not verify this transaction.",
-  "⚠️ This transaction has already been used.",
-  "💰 We have not received your payment yet.",
-  "🔄 Please wait for the blockchain confirmation.",
-  "📋 Please send your transaction hash.",
-  "💳 Please make sure you sent the correct amount.",
-  "⚠️ The payment amount does not match your order.",
-  "🕐 Your order is still being processed.",
-  "✅ Your order has been completed successfully.",
-  "📦 Your PTN tokens have been sent.",
-  "❌ Your order could not be completed.",
-  "🔎 We are checking the payment details now.",
-  "⚠️ Please do not send another payment while your transaction is being checked.",
-  "📩 Your message has been received. Support will respond shortly.",
-  "🔐 Your request requires additional verification.",
-  "⚠️ Please contact support if you believe this result is incorrect.",
-  "🙏 Thank you for your patience."
-];
-
-/* =========================================================
-   WORKER
-========================================================= */
+const PAYOUT_CONFIRM_ATTEMPTS = 5;
+const PAYOUT_CONFIRM_DELAY_MS = 2000;
 
 export default {
-  async fetch(request, env, ctx) {
-
-    if (request.method !== "POST") {
-      return new Response(
-        "PAYTON BOT OK",
-        { status: 200 }
-      );
-    }
-
-    await ensureExtraTables(env);
-    await ensureOrdersSchema(env);
-
-    let update;
-
+  async fetch(request, env) {
     try {
-      update = await request.json();
-    } catch {
-      return new Response(
-        "OK",
-        { status: 200 }
-      );
-    }
+      if (new URL(request.url).pathname === "/") {
+        return new Response(
+          JSON.stringify({
+            ok: true,
+            service: "payton-presale",
+            network: "mainnet"
+          }),
+          {
+            headers: {
+              "content-type": "application/json"
+            }
+          }
+        );
+      }
 
-    try {
-      await handleUpdate(
-        update,
-        env,
-        ctx
-      );
+      return new Response("OK");
     } catch (error) {
-      console.error(
-        "UPDATE ERROR:",
-        error
-      );
+      console.error("FETCH ERROR:", error);
+      return new Response("Internal error", { status: 500 });
     }
-
-    return new Response(
-      "OK",
-      { status: 200 }
-    );
   },
 
   async scheduled(event, env, ctx) {
-
     ctx.waitUntil(
-      (async () => {
-
-        try {
-
-          await ensureExtraTables(env);
-          await ensureOrdersSchema(env);
-          await processOrders(env);
-
-        } catch (error) {
-
-          console.error(
-            "CRON ERROR:",
-            error
-          );
-        }
-
-      })()
+      processOrders(env).catch(error => {
+        console.error("SCHEDULE ERROR:", error);
+      })
     );
   }
 };
 
-/* =========================================================
-   DATABASE TABLES
-========================================================= */
+function requireEnv(env, name) {
+  const value = String(env[name] || "").trim();
 
-async function ensureExtraTables(env) {
+  if (!value) {
+    throw new Error(`${name} missing`);
+  }
 
-  await env.DB.prepare(`
-    CREATE TABLE IF NOT EXISTS support_messages (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      telegram_id TEXT NOT NULL,
-      username TEXT,
-      message TEXT NOT NULL,
-      status TEXT DEFAULT 'open',
-      admin_reply TEXT,
-      created_at TEXT DEFAULT CURRENT_TIMESTAMP
-    )
-  `).run();
-
-  await env.DB.prepare(`
-    CREATE TABLE IF NOT EXISTS suspicious_users (
-      telegram_id TEXT PRIMARY KEY,
-      username TEXT,
-      reason TEXT,
-      suspicious_count INTEGER DEFAULT 1,
-      blocked_until TEXT,
-      permanent INTEGER DEFAULT 0,
-      created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-      updated_at TEXT DEFAULT CURRENT_TIMESTAMP
-    )
-  `).run();
-
-  await env.DB.prepare(`
-    CREATE TABLE IF NOT EXISTS admin_states (
-      telegram_id TEXT PRIMARY KEY,
-      mode TEXT,
-      target_id TEXT,
-      updated_at TEXT DEFAULT CURRENT_TIMESTAMP
-    )
-  `).run();
+  return value;
 }
 
-async function ensureOrdersSchema(env) {
+function normalizeAddress(value) {
+  return Address.parse(String(value)).toRawString();
+}
+
+function sameAddress(a, b) {
+  try {
+    return normalizeAddress(a) === normalizeAddress(b);
+  } catch {
+    return false;
+  }
+}
+
+function decimalToUnits(value, decimals) {
+  const input = String(value).trim();
+
+  if (!input) {
+    throw new Error("Invalid decimal value");
+  }
+
+  const parts = input.split(".");
+
+  if (parts.length > 2) {
+    throw new Error("Invalid decimal value");
+  }
+
+  const whole = parts[0] || "0";
+  const fraction = parts[1] || "";
+
+  if (
+    !/^\d+$/.test(whole) ||
+    !/^\d*$/.test(fraction) ||
+    fraction.length > decimals
+  ) {
+    throw new Error("Invalid decimal value");
+  }
+
+  const scale = 10n ** BigInt(decimals);
+
+  const paddedFraction = (
+    fraction + "0".repeat(decimals)
+  ).slice(0, decimals);
+
+  const fractionUnits = paddedFraction
+    ? BigInt(paddedFraction)
+    : 0n;
+
+  return BigInt(whole) * scale + fractionUnits;
+}
+
+function gramToNano(gram) {
+  return decimalToUnits(gram, 9);
+}
+
+function unitsToDecimal(units, decimals) {
+  const scale = 10n ** BigInt(decimals);
+
+  const whole = units / scale;
+
+  const fraction = (units % scale)
+    .toString()
+    .padStart(decimals, "0")
+    .replace(/0+$/, "");
+
+  return fraction
+    ? `${whole}.${fraction}`
+    : whole.toString();
+}
+
+function gramToPtn(gram) {
+  const gramNano = gramToNano(gram);
+  const ptnUnits = gramNano * PTN_PER_GRAM;
+
+  return unitsToDecimal(ptnUnits, PTN_DECIMALS);
+}
+
+function getOrderCreatedUtime(order) {
+  if (order.created_at === null || order.created_at === undefined) {
+    return 0;
+  }
+
+  const value = String(order.created_at).trim();
+
+  if (/^\d+$/.test(value)) {
+    const numeric = Number(value);
+
+    if (numeric > 1000000000000) {
+      return Math.floor(numeric / 1000);
+    }
+
+    return numeric;
+  }
+
+  const timestamp = Date.parse(value);
+
+  if (!Number.isFinite(timestamp)) {
+    return 0;
+  }
+
+  return Math.floor(timestamp / 1000);
+}
+
+function decodeComment(msgData) {
+  if (!msgData || typeof msgData !== "string") {
+    return "";
+  }
 
   try {
+    const cell = Cell.fromBase64(msgData);
+    const slice = cell.beginParse();
 
-    const columns =
-      await env.DB.prepare(`
-        PRAGMA table_info(orders)
-      `).all();
-
-    const results =
-      columns?.results || [];
-
-    const hasPayoutTxHash =
-      results.some(
-        column =>
-          column.name === "payout_tx_hash"
-      );
-
-    if (!hasPayoutTxHash) {
-
-      await env.DB.prepare(`
-        ALTER TABLE orders
-        ADD COLUMN payout_tx_hash TEXT
-      `).run();
+    if (slice.remainingBits < 32) {
+      return "";
     }
 
-  } catch (error) {
+    const opcode = slice.loadUint(32);
 
-    console.error(
-      "ORDERS SCHEMA ERROR:",
-      error
-    );
-  }
-
-  try {
-
-    await env.DB.prepare(`
-      CREATE INDEX IF NOT EXISTS
-      idx_orders_status_id
-      ON orders(status, id)
-    `).run();
-
-  } catch (error) {
-
-    console.error(
-      "ORDERS INDEX ERROR:",
-      error
-    );
-  }
-}
-
-/* =========================================================
-   ADMIN MENU
-========================================================= */
-
-async function getAdminMenu(env) {
-
-  let supportCount = 0;
-
-  try {
-
-    const row =
-      await env.DB.prepare(`
-        SELECT COUNT(*) AS count
-        FROM support_messages
-        WHERE status='open'
-      `).first();
-
-    supportCount =
-      Number(row?.count || 0);
-
-  } catch (error) {
-
-    console.error(
-      "SUPPORT COUNT ERROR:",
-      error
-    );
-  }
-
-  return {
-    inline_keyboard: [
-      [
-        {
-          text: "📊 Dashboard",
-          callback_data: "admin_dashboard"
-        }
-      ],
-      [
-        {
-          text: "📋 All Orders",
-          callback_data: "admin_orders"
-        },
-        {
-          text: "⏳ Pending",
-          callback_data: "admin_pending"
-        }
-      ],
-      [
-        {
-          text: "👥 Users",
-          callback_data: "admin_users"
-        },
-        {
-          text:
-            `💬 Support${supportCount > 0 ? `(${supportCount})` : ""}`,
-          callback_data: "admin_support"
-        }
-      ],
-      [
-        {
-          text: "🚨 Suspicious",
-          callback_data: "admin_suspicious"
-        },
-        {
-          text: "💰 Revenue",
-          callback_data: "admin_revenue"
-        }
-      ],
-      [
-        {
-          text: "⚡ Reply Templates",
-          callback_data: "admin_templates"
-        }
-      ],
-      [
-        {
-          text: "🔄 Refresh",
-          callback_data: "admin_dashboard"
-        }
-      ]
-    ]
-  };
-}
-
-/* =========================================================
-   UPDATE HANDLER
-========================================================= */
-
-async function handleUpdate(
-  update,
-  env,
-  ctx
-) {
-
-  if (update.callback_query) {
-
-    await handleCallback(
-      update.callback_query,
-      env
-    );
-
-    return;
-  }
-
-  if (!update.message) {
-    return;
-  }
-
-  const message =
-    update.message;
-
-  const chatId =
-    String(
-      message.chat?.id || ""
-    );
-
-  const text =
-    String(
-      message.text || ""
-    ).trim();
-
-  if (!chatId) {
-    return;
-  }
-
-  if (chatId === ADMIN_TELEGRAM_ID) {
-
-    if (text === "/admin") {
-
-      await clearAdminState(env);
-
-      await telegram(
-        env,
-        "sendMessage",
-        {
-          chat_id: chatId,
-          text: "🛠 PAYTON Admin Panel",
-          reply_markup:
-            await getAdminMenu(env)
-        }
-      );
-
-      return;
+    if (opcode !== 0) {
+      return "";
     }
 
-    const handled =
-      await handleAdminText(
-        message,
-        env
-      );
+    const bytes = [];
 
-    if (handled) {
-      return;
-    }
-  }
-
-  if (
-    chatId !==
-    ADMIN_TELEGRAM_ID
-  ) {
-
-    const restriction =
-      await getUserRestriction(
-        env,
-        chatId
-      );
-
-    if (restriction) {
-
-      await sendBlockedMessage(
-        env,
-        chatId,
-        restriction
-      );
-
-      return;
-    }
-  }
-
-  if (text === "/start") {
-
-    await upsertUser(
-      env,
-      message.from
-    );
-
-    await telegram(
-      env,
-      "sendMessage",
-      {
-        chat_id: chatId,
-        text: WELCOME,
-        reply_markup: MENU
+    function readSnake(currentSlice) {
+      while (currentSlice.remainingBits >= 8) {
+        bytes.push(currentSlice.loadUint(8));
       }
-    );
 
-    return;
-  }
-
-  if (
-    chatId !==
-    ADMIN_TELEGRAM_ID
-  ) {
-
-    const supportHandled =
-      await handleSupportMessage(
-        message,
-        env
-      );
-
-    if (supportHandled) {
-      return;
-    }
-  }
-
-  if (
-    chatId !==
-    ADMIN_TELEGRAM_ID
-  ) {
-
-    const state =
-      await getPendingOrder(
-        env,
-        chatId
-      );
-
-    if (state) {
-
-      await handleOrderText(
-        message,
-        state,
-        env
-      );
-
-      return;
-    }
-
-    if (text) {
-
-      await telegram(
-        env,
-        "sendMessage",
-        {
-          chat_id: chatId,
-          text:
-            "Please use the menu below.",
-          reply_markup: MENU
-        }
-      );
-    }
-  }
-}
-
-/* =========================================================
-   USER CALLBACKS
-========================================================= */
-
-async function handleCallback(
-  query,
-  env
-) {
-
-  const data =
-    String(
-      query.data || ""
-    );
-
-  const chatId =
-    String(
-      query.message?.chat?.id || ""
-    );
-
-  if (!chatId) {
-    return;
-  }
-
-  if (data.startsWith("admin_")) {
-
-    if (
-      chatId !==
-      ADMIN_TELEGRAM_ID
-    ) {
-
-      await telegram(
-        env,
-        "answerCallbackQuery",
-        {
-          callback_query_id:
-            query.id,
-          text:
-            "Access denied."
-        }
-      );
-
-      return;
-    }
-
-    await handleAdminCallback(
-      query,
-      env
-    );
-
-    return;
-  }
-
-  const restriction =
-    await getUserRestriction(
-      env,
-      chatId
-    );
-
-  if (restriction) {
-
-    await telegram(
-      env,
-      "answerCallbackQuery",
-      {
-        callback_query_id:
-          query.id,
-        text:
-          "Your access to this bot is currently restricted."
-      }
-    );
-
-    await sendBlockedMessage(
-      env,
-      chatId,
-      restriction
-    );
-
-    return;
-  }
-
-  await telegram(
-    env,
-    "answerCallbackQuery",
-    {
-      callback_query_id:
-        query.id
-    }
-  );
-
-  if (data === "home") {
-
-    await editMessage(
-      env,
-      query,
-      WELCOME,
-      MENU
-    );
-
-    return;
-  }
-
-  if (data === "buy") {
-
-    await upsertUser(
-      env,
-      query.from
-    );
-
-    await telegram(
-      env,
-      "sendMessage",
-      {
-        chat_id: chatId,
-        text:
-          "🪙 Buy PTN\n\n" +
-          "Please enter the amount of GRAM you want to pay.\n\n" +
-          "Example:\n" +
-          "10\n\n" +
-          "You will receive 10,000,000 PTN.",
-        reply_markup: BACK
-      }
-    );
-
-    await createInitialOrder(
-      env,
-      chatId
-    );
-
-    return;
-  }
-
-  if (data === "price") {
-
-    await editMessage(
-      env,
-      query,
-      "💰 PAYTON (PTN) Presale Price\n\n1 GRAM = 1,000,000 PTN",
-      BACK
-    );
-
-    return;
-  }
-
-  if (data === "orders") {
-
-    await showUserOrders(
-      env,
-      query
-    );
-
-    return;
-  }
-
-  if (data === "support") {
-
-    await createSupportRequest(
-      env,
-      query.from
-    );
-
-    await editMessage(
-      env,
-      query,
-      "💬 Support\n\n" +
-      "Please send your message now.\n\n" +
-      "Our support team will review your message and reply to you.",
-      BACK
-    );
-
-    return;
-  }
-}
-
-/* =========================================================
-   ADMIN CALLBACKS
-========================================================= */
-
-async function handleAdminCallback(
-  query,
-  env
-) {
-
-  const data =
-    String(
-      query.data || ""
-    );
-
-  await telegram(
-    env,
-    "answerCallbackQuery",
-    {
-      callback_query_id:
-        query.id
-    }
-  );
-
-  if (data === "admin_home") {
-
-    await editMessage(
-      env,
-      query,
-      "🛠 PAYTON Admin Panel",
-      await getAdminMenu(env)
-    );
-
-    return;
-  }
-
-  if (data === "admin_dashboard") {
-    await showAdminDashboard(env, query);
-    return;
-  }
-
-  if (data === "admin_orders") {
-    await showAdminOrders(env, query);
-    return;
-  }
-
-  if (data === "admin_pending") {
-    await showAdminPending(env, query);
-    return;
-  }
-
-  if (data === "admin_users") {
-    await showAdminUsers(env, query);
-    return;
-  }
-
-  if (data.startsWith("admin_user_")) {
-
-    const telegramId =
-      data.replace(
-        "admin_user_",
-        ""
-      );
-
-    if (telegramId) {
-      await showAdminUser(
-        env,
-        query,
-        telegramId
-      );
-    }
-
-    return;
-  }
-
-  if (data.startsWith("admin_ub1_")) {
-
-    await blockUser(
-      env,
-      query,
-      data.slice(
-        "admin_ub1_".length
-      ),
-      1
-    );
-
-    return;
-  }
-
-  if (data.startsWith("admin_ub3_")) {
-
-    await blockUser(
-      env,
-      query,
-      data.slice(
-        "admin_ub3_".length
-      ),
-      3
-    );
-
-    return;
-  }
-
-  if (data.startsWith("admin_ub7_")) {
-
-    await blockUser(
-      env,
-      query,
-      data.slice(
-        "admin_ub7_".length
-      ),
-      7
-    );
-
-    return;
-  }
-
-  if (data.startsWith("admin_ubp_")) {
-
-    await blockUser(
-      env,
-      query,
-      data.slice(
-        "admin_ubp_".length
-      ),
-      "permanent"
-    );
-
-    return;
-  }
-
-  if (data.startsWith("admin_ubu_")) {
-
-    await unblockUser(
-      env,
-      query,
-      data.slice(
-        "admin_ubu_".length
-      )
-    );
-
-    return;
-  }
-
-  if (data === "admin_revenue") {
-
-    await showAdminRevenue(
-      env,
-      query
-    );
-
-    return;
-  }
-
-  if (data === "admin_support") {
-
-    await showSupportInbox(
-      env,
-      query
-    );
-
-    return;
-  }
-
-  if (data.startsWith("admin_ticket_")) {
-
-    const id =
-      Number(
-        data.replace(
-          "admin_ticket_",
-          ""
-        )
-      );
-
-    if (
-      Number.isInteger(id) &&
-      id > 0
-    ) {
-
-      await showSupportTicket(
-        env,
-        query,
-        id
-      );
-    }
-
-    return;
-  }
-
-  if (data.startsWith("admin_reply_")) {
-
-    const id =
-      Number(
-        data.replace(
-          "admin_reply_",
-          ""
-        )
-      );
-
-    if (
-      Number.isInteger(id) &&
-      id > 0
-    ) {
-
-      await setAdminState(
-        env,
-        "reply",
-        String(id)
-      );
-
-      await editMessage(
-        env,
-        query,
-        "✍️ Manual Reply\n\n" +
-        "Send the message you want to send to this user.\n\n" +
-        "Send /cancel to cancel.",
-        {
-          inline_keyboard: [
-            [
-              {
-                text: "❌ Cancel",
-                callback_data:
-                  "admin_cancel_reply"
-              }
-            ]
-          ]
-        }
-      );
-    }
-
-    return;
-  }
-
-  if (
-    data ===
-    "admin_cancel_reply"
-  ) {
-
-    await clearAdminState(env);
-
-    await editMessage(
-      env,
-      query,
-      "🛠 PAYTON Admin Panel",
-      await getAdminMenu(env)
-    );
-
-    return;
-  }
-
-  if (data.startsWith("admin_quick_")) {
-
-    const parts =
-      data.split("_");
-
-    if (parts.length >= 4) {
-
-      const ticketId =
-        Number(parts[2]);
-
-      const page =
-        Number(parts[3] || 0);
-
-      if (
-        Number.isInteger(ticketId) &&
-        Number.isInteger(page)
-      ) {
-
-        await showQuickReplies(
-          env,
-          query,
-          ticketId,
-          page
-        );
+      while (currentSlice.remainingRefs > 0) {
+        const next = currentSlice.loadRef().beginParse();
+        readSnake(next);
       }
     }
 
-    return;
-  }
+    readSnake(slice);
 
-  if (data.startsWith("admin_qsend_")) {
-
-    const parts =
-      data.split("_");
-
-    if (parts.length >= 4) {
-
-      const ticketId =
-        Number(parts[2]);
-
-      const index =
-        Number(parts[3]);
-
-      if (
-        Number.isInteger(ticketId) &&
-        Number.isInteger(index) &&
-        QUICK_REPLIES[index]
-      ) {
-
-        await sendQuickReply(
-          env,
-          query,
-          ticketId,
-          index
-        );
-      }
-    }
-
-    return;
-  }
-
-  if (
-    data ===
-    "admin_suspicious"
-  ) {
-
-    await showSuspiciousUsers(
-      env,
-      query
-    );
-
-    return;
-  }
-
-  if (data.startsWith("admin_sus_")) {
-
-    const telegramId =
-      data.replace(
-        "admin_sus_",
-        ""
-      );
-
-    if (telegramId) {
-
-      await showSuspiciousUser(
-        env,
-        query,
-        telegramId
-      );
-    }
-
-    return;
-  }
-
-  if (data.startsWith("admin_b1_")) {
-
-    await blockSuspiciousUser(
-      env,
-      query,
-      data.slice(
-        "admin_b1_".length
-      ),
-      1
-    );
-
-    return;
-  }
-
-  if (data.startsWith("admin_b3_")) {
-
-    await blockSuspiciousUser(
-      env,
-      query,
-      data.slice(
-        "admin_b3_".length
-      ),
-      3
-    );
-
-    return;
-  }
-
-  if (data.startsWith("admin_b7_")) {
-
-    await blockSuspiciousUser(
-      env,
-      query,
-      data.slice(
-        "admin_b7_".length
-      ),
-      7
-    );
-
-    return;
-  }
-
-  if (data.startsWith("admin_bp_")) {
-
-    await blockSuspiciousUser(
-      env,
-      query,
-      data.slice(
-        "admin_bp_".length
-      ),
-      "permanent"
-    );
-
-    return;
-  }
-
-  if (data.startsWith("admin_bu_")) {
-
-    await unblockSuspiciousUser(
-      env,
-      query,
-      data.slice(
-        "admin_bu_".length
-      )
-    );
-
-    return;
-  }
-
-  if (
-    data ===
-    "admin_templates"
-  ) {
-
-    await showTemplates(
-      env,
-      query
-    );
-
-    return;
+    return new TextDecoder()
+      .decode(new Uint8Array(bytes))
+      .replace(/\0+$/, "")
+      .trim();
+  } catch {
+    return "";
   }
 }
 
-/* =========================================================
-   ADMIN TEXT / SUPPORT
-========================================================= */
-
-async function handleAdminText(
-  message,
-  env
-) {
-
-  const text =
-    String(
-      message.text || ""
-    ).trim();
+function extractOrderIdFromComment(comment) {
+  const text = String(comment || "").trim();
 
   if (!text) {
-    return false;
-  }
-
-  if (text === "/cancel") {
-
-    await clearAdminState(env);
-
-    await telegram(
-      env,
-      "sendMessage",
-      {
-        chat_id:
-          ADMIN_TELEGRAM_ID,
-        text:
-          "❌ Reply cancelled.",
-        reply_markup:
-          await getAdminMenu(env)
-      }
-    );
-
-    return true;
-  }
-
-  const state =
-    await getAdminState(env);
-
-  if (!state) {
-    return false;
-  }
-
-  if (state.mode === "reply") {
-
-    const ticketId =
-      Number(
-        state.target_id
-      );
-
-    if (!ticketId) {
-
-      await clearAdminState(env);
-
-      return true;
-    }
-
-    const ticket =
-      await env.DB.prepare(`
-        SELECT *
-        FROM support_messages
-        WHERE id=?
-        LIMIT 1
-      `)
-      .bind(ticketId)
-      .first();
-
-    if (!ticket) {
-
-      await clearAdminState(env);
-
-      await telegram(
-        env,
-        "sendMessage",
-        {
-          chat_id:
-            ADMIN_TELEGRAM_ID,
-          text:
-            "❌ Support ticket not found.",
-          reply_markup:
-            await getAdminMenu(env)
-        }
-      );
-
-      return true;
-    }
-
-    await telegram(
-      env,
-      "sendMessage",
-      {
-        chat_id:
-          ticket.telegram_id,
-        text:
-          "💬 Support\n\n" +
-          text +
-          "\n\nIf you need further assistance, please send another message.",
-        reply_markup:
-          MENU
-      }
-    );
-
-    await env.DB.prepare(`
-      UPDATE support_messages
-      SET status='replied',
-          admin_reply=?
-      WHERE id=?
-    `)
-    .bind(
-      text,
-      ticketId
-    )
-    .run();
-
-    await clearAdminState(env);
-
-    await telegram(
-      env,
-      "sendMessage",
-      {
-        chat_id:
-          ADMIN_TELEGRAM_ID,
-        text:
-          "✅ Reply sent successfully.",
-        reply_markup:
-          await getAdminMenu(env)
-      }
-    );
-
-    return true;
-  }
-
-  return false;
-}
-
-async function createSupportRequest(
-  env,
-  user
-) {
-
-  const telegramId =
-    String(user.id);
-
-  const username =
-    user.username
-      ? `@${user.username}`
-      : null;
-
-  const existing =
-    await env.DB.prepare(`
-      SELECT id
-      FROM support_messages
-      WHERE telegram_id=?
-        AND status='awaiting_message'
-      ORDER BY id DESC
-      LIMIT 1
-    `)
-    .bind(telegramId)
-    .first();
-
-  if (existing) {
-    return;
-  }
-
-  await env.DB.prepare(`
-    INSERT INTO support_messages
-    (
-      telegram_id,
-      username,
-      message,
-      status
-    )
-    VALUES (?, ?, ?, 'awaiting_message')
-  `)
-  .bind(
-    telegramId,
-    username,
-    "AWAITING_MESSAGE"
-  )
-  .run();
-}
-
-async function handleSupportMessage(
-  message,
-  env
-) {
-
-  const telegramId =
-    String(
-      message.from?.id || ""
-    );
-
-  const text =
-    String(
-      message.text || ""
-    ).trim();
-
-  if (
-    !telegramId ||
-    !text
-  ) {
-    return false;
-  }
-
-  const ticket =
-    await env.DB.prepare(`
-      SELECT *
-      FROM support_messages
-      WHERE telegram_id=?
-        AND status='awaiting_message'
-      ORDER BY id DESC
-      LIMIT 1
-    `)
-    .bind(telegramId)
-    .first();
-
-  if (!ticket) {
-    return false;
-  }
-
-  const username =
-    message.from?.username
-      ? `@${message.from.username}`
-      : "No username";
-
-  await env.DB.prepare(`
-    UPDATE support_messages
-    SET username=?,
-        message=?,
-        status='open'
-    WHERE id=?
-  `)
-  .bind(
-    username,
-    text,
-    ticket.id
-  )
-  .run();
-
-  await telegram(
-    env,
-    "sendMessage",
-    {
-      chat_id:
-        telegramId,
-      text:
-        "📩 Your message has been received.\n\n" +
-        "Support will respond shortly.",
-      reply_markup:
-        MENU
-    }
-  );
-
-  await telegram(
-    env,
-    "sendMessage",
-    {
-      chat_id:
-        ADMIN_TELEGRAM_ID,
-      text:
-        "💬 New Support Message\n\n" +
-        `Ticket: #${ticket.id}\n` +
-        `User: ${username}\n` +
-        `ID: ${telegramId}\n\n` +
-        "Message:\n" +
-        text,
-      reply_markup: {
-        inline_keyboard: [
-          [
-            {
-              text: "↩️ Reply",
-              callback_data:
-                `admin_ticket_${ticket.id}`
-            }
-          ]
-        ]
-      }
-    }
-  );
-
-  return true;
-}
-
-/* =========================================================
-   SUPPORT ADMIN
-========================================================= */
-
-async function showSupportInbox(
-  env,
-  query
-) {
-
-  const rows =
-    await env.DB.prepare(`
-      SELECT *
-      FROM support_messages
-      WHERE status='open'
-      ORDER BY id DESC
-      LIMIT 20
-    `)
-    .all();
-
-  const buttons = [];
-
-  for (
-    const row of
-    rows.results || []
-  ) {
-
-    const name =
-      row.username ||
-      row.telegram_id;
-
-    buttons.push([
-      {
-        text:
-          `💬 #${row.id} ${shortText(
-            name,
-            30
-          )}`,
-        callback_data:
-          `admin_ticket_${row.id}`
-      }
-    ]);
-  }
-
-  buttons.push([
-    {
-      text:
-        "⬅️ Admin Panel",
-      callback_data:
-        "admin_home"
-    }
-  ]);
-
-  const count =
-    rows.results?.length || 0;
-
-  const text =
-    `💬 Support Inbox (${count})\n\n` +
-    (
-      count
-        ? "Open support tickets:"
-        : "No open support tickets."
-    );
-
-  await editMessage(
-    env,
-    query,
-    text,
-    {
-      inline_keyboard:
-        buttons
-    }
-  );
-}
-
-async function showSupportTicket(
-  env,
-  query,
-  ticketId
-) {
-
-  const ticket =
-    await env.DB.prepare(`
-      SELECT *
-      FROM support_messages
-      WHERE id=?
-      LIMIT 1
-    `)
-    .bind(ticketId)
-    .first();
-
-  if (!ticket) {
-
-    await editMessage(
-      env,
-      query,
-      "❌ Support ticket not found.",
-      ADMIN_BACK
-    );
-
-    return;
-  }
-
-  const username =
-    ticket.username ||
-    "No username";
-
-  const text =
-    "💬 Support Ticket\n\n" +
-    `Ticket: #${ticket.id}\n` +
-    `User: ${username}\n` +
-    `Telegram ID: ${ticket.telegram_id}\n` +
-    `Status: ${ticket.status}\n\n` +
-    "Message:\n" +
-    shortText(
-      ticket.message,
-      3000
-    );
-
-  await editMessage(
-    env,
-    query,
-    text,
-    {
-      inline_keyboard: [
-        [
-          {
-            text:
-              "↩️ Manual Reply",
-            callback_data:
-              `admin_reply_${ticket.id}`
-          }
-        ],
-        [
-          {
-            text:
-              "⚡ Quick Replies",
-            callback_data:
-              `admin_quick_${ticket.id}_0`
-          }
-        ],
-        [
-          {
-            text:
-              "⬅️ Support Inbox",
-            callback_data:
-              "admin_support"
-          }
-        ]
-      ]
-    }
-  );
-}
-
-async function showQuickReplies(
-  env,
-  query,
-  ticketId,
-  page = 0
-) {
-
-  const ticket =
-    await env.DB.prepare(`
-      SELECT *
-      FROM support_messages
-      WHERE id=?
-      LIMIT 1
-    `)
-    .bind(ticketId)
-    .first();
-
-  if (!ticket) {
-
-    await editMessage(
-      env,
-      query,
-      "❌ Support ticket not found.",
-      ADMIN_BACK
-    );
-
-    return;
-  }
-
-  const pageSize = 5;
-
-  const totalPages =
-    Math.ceil(
-      QUICK_REPLIES.length /
-      pageSize
-    );
-
-  if (page < 0) {
-    page = 0;
-  }
-
-  if (page >= totalPages) {
-    page = totalPages - 1;
-  }
-
-  const start =
-    page * pageSize;
-
-  const end =
-    Math.min(
-      start + pageSize,
-      QUICK_REPLIES.length
-    );
-
-  const buttons = [];
-
-  for (
-    let i = start;
-    i < end;
-    i++
-  ) {
-
-    buttons.push([
-      {
-        text:
-          `${i + 1}. ${shortText(
-            QUICK_REPLIES[i],
-            42
-          )}`,
-        callback_data:
-          `admin_qsend_${ticketId}_${i}`
-      }
-    ]);
-  }
-
-  const navigation = [];
-
-  if (page > 0) {
-
-    navigation.push({
-      text:
-        "⬅️ Previous",
-      callback_data:
-        `admin_quick_${ticketId}_${page - 1}`
-    });
-  }
-
-  if (
-    page <
-    totalPages - 1
-  ) {
-
-    navigation.push({
-      text:
-        "Next ➡️",
-      callback_data:
-        `admin_quick_${ticketId}_${page + 1}`
-    });
-  }
-
-  if (navigation.length) {
-    buttons.push(navigation);
-  }
-
-  buttons.push([
-    {
-      text:
-        "⬅️ Ticket",
-      callback_data:
-        `admin_ticket_${ticketId}`
-    }
-  ]);
-
-  await editMessage(
-    env,
-    query,
-    `⚡ Quick Replies\n\nTicket #${ticketId}\nPage ${page + 1}/${totalPages}`,
-    {
-      inline_keyboard:
-        buttons
-    }
-  );
-}
-
-async function sendQuickReply(
-  env,
-  query,
-  ticketId,
-  index
-) {
-
-  const ticket =
-    await env.DB.prepare(`
-      SELECT *
-      FROM support_messages
-      WHERE id=?
-      LIMIT 1
-    `)
-    .bind(ticketId)
-    .first();
-
-  if (!ticket) {
-
-    await editMessage(
-      env,
-      query,
-      "❌ Support ticket not found.",
-      ADMIN_BACK
-    );
-
-    return;
-  }
-
-  const reply =
-    QUICK_REPLIES[index];
-
-  await telegram(
-    env,
-    "sendMessage",
-    {
-      chat_id:
-        ticket.telegram_id,
-      text:
-        "💬 Support\n\n" +
-        reply,
-      reply_markup:
-        MENU
-    }
-  );
-
-  await env.DB.prepare(`
-    UPDATE support_messages
-    SET status='replied',
-        admin_reply=?
-    WHERE id=?
-  `)
-  .bind(
-    reply,
-    ticketId
-  )
-  .run();
-
-  await editMessage(
-    env,
-    query,
-    "✅ Quick reply sent successfully.",
-    {
-      inline_keyboard: [
-        [
-          {
-            text:
-              "⬅️ Support Inbox",
-            callback_data:
-              "admin_support"
-          }
-        ],
-        [
-          {
-            text:
-              "🛠 Admin Panel",
-            callback_data:
-              "admin_home"
-          }
-        ]
-      ]
-    }
-  );
-}
-
-async function showTemplates(
-  env,
-  query
-) {
-
-  let text =
-    "⚡ Reply Templates\n\n";
-
-  QUICK_REPLIES.forEach(
-    (reply, index) => {
-
-      text +=
-        `${index + 1}. ${reply}\n\n`;
-    }
-  );
-
-  await editMessage(
-    env,
-    query,
-    shortText(
-      text,
-      3900
-    ),
-    ADMIN_BACK
-  );
-}
-
-/* =========================================================
-   SUSPICIOUS USERS
-========================================================= */
-
-async function flagSuspicious(
-  env,
-  telegramId,
-  username,
-  reason
-) {
-
-  await env.DB.prepare(`
-    INSERT INTO suspicious_users
-    (
-      telegram_id,
-      username,
-      reason,
-      suspicious_count,
-      blocked_until,
-      permanent
-    )
-    VALUES (?, ?, ?, 1, NULL, 0)
-
-    ON CONFLICT(telegram_id)
-    DO UPDATE SET
-      username=excluded.username,
-      reason=excluded.reason,
-      suspicious_count=
-        suspicious_users.suspicious_count + 1,
-      updated_at=CURRENT_TIMESTAMP
-  `)
-  .bind(
-    String(telegramId),
-    username || null,
-    reason
-  )
-  .run();
-}
-
-async function showSuspiciousUsers(
-  env,
-  query
-) {
-
-  const rows =
-    await env.DB.prepare(`
-      SELECT *
-      FROM suspicious_users
-      ORDER BY updated_at DESC
-      LIMIT 30
-    `)
-    .all();
-
-  const buttons = [];
-
-  for (
-    const row of
-    rows.results || []
-  ) {
-
-    let status =
-      "⚠️";
-
-    if (
-      Number(row.permanent) === 1
-    ) {
-
-      status =
-        "🚫";
-
-    } else if (
-      row.blocked_until
-    ) {
-
-      status =
-        "⏳";
-    }
-
-    const name =
-      row.username ||
-      row.telegram_id;
-
-    buttons.push([
-      {
-        text:
-          `${status} ${shortText(
-            name,
-            25
-          )}`,
-        callback_data:
-          `admin_sus_${row.telegram_id}`
-      }
-    ]);
-  }
-
-  buttons.push([
-    {
-      text:
-        "⬅️ Admin Panel",
-      callback_data:
-        "admin_home"
-    }
-  ]);
-
-  await editMessage(
-    env,
-    query,
-    "🚨 Suspicious Users",
-    {
-      inline_keyboard:
-        buttons
-    }
-  );
-}
-
-async function showSuspiciousUser(
-  env,
-  query,
-  telegramId
-) {
-
-  const row =
-    await env.DB.prepare(`
-      SELECT *
-      FROM suspicious_users
-      WHERE telegram_id=?
-      LIMIT 1
-    `)
-    .bind(telegramId)
-    .first();
-
-  if (!row) {
-
-    await editMessage(
-      env,
-      query,
-      "User not found.",
-      ADMIN_BACK
-    );
-
-    return;
-  }
-
-  const buttons = [
-    [
-      {
-        text:
-          "⏳ Block 1 day",
-        callback_data:
-          `admin_b1_${telegramId}`
-      }
-    ],
-    [
-      {
-        text:
-          "⏳ Block 3 days",
-        callback_data:
-          `admin_b3_${telegramId}`
-      }
-    ],
-    [
-      {
-        text:
-          "⏳ Block 7 days",
-        callback_data:
-          `admin_b7_${telegramId}`
-      }
-    ],
-    [
-      {
-        text:
-          "🚫 Permanent",
-        callback_data:
-          `admin_bp_${telegramId}`
-      }
-    ],
-    [
-      {
-        text:
-          "🔓 Unblock",
-        callback_data:
-          `admin_bu_${telegramId}`
-      }
-    ],
-    [
-      {
-        text:
-          "⬅️ Suspicious",
-        callback_data:
-          "admin_suspicious"
-      }
-    ]
-  ];
-
-  const text =
-    "🚨 Suspicious User\n\n" +
-    `User: ${row.username || "No username"}\n` +
-    `Telegram ID: ${telegramId}\n` +
-    `Reason: ${row.reason || "Unknown"}\n` +
-    `Count: ${row.suspicious_count}\n` +
-    `Status: ${getBlockStatusText(row)}\n`;
-
-  await editMessage(
-    env,
-    query,
-    text,
-    {
-      inline_keyboard:
-        buttons
-    }
-  );
-}
-
-/* =========================================================
-   USER BLOCKING
-========================================================= */
-
-async function ensureUserBlockRecord(
-  env,
-  telegramId,
-  username
-) {
-
-  await env.DB.prepare(`
-    INSERT INTO suspicious_users
-    (
-      telegram_id,
-      username,
-      reason
-    )
-    VALUES (?, ?, 'Admin block')
-
-    ON CONFLICT(telegram_id)
-    DO UPDATE SET
-      username=excluded.username,
-      updated_at=CURRENT_TIMESTAMP
-  `)
-  .bind(
-    String(telegramId),
-    username || null
-  )
-  .run();
-}
-
-async function blockUser(
-  env,
-  query,
-  telegramId,
-  days
-) {
-
-  await ensureUserBlockRecord(
-    env,
-    telegramId,
-    null
-  );
-
-  let blockedUntil;
-
-  if (
-    days ===
-    "permanent"
-  ) {
-
-    await env.DB.prepare(`
-      UPDATE suspicious_users
-      SET permanent=1,
-          blocked_until=NULL,
-          updated_at=CURRENT_TIMESTAMP
-      WHERE telegram_id=?
-    `)
-    .bind(telegramId)
-    .run();
-
-  } else {
-
-    blockedUntil =
-      new Date(
-        Date.now() +
-        Number(days) *
-        86400000
-      ).toISOString();
-
-    await env.DB.prepare(`
-      UPDATE suspicious_users
-      SET permanent=0,
-          blocked_until=?,
-          updated_at=CURRENT_TIMESTAMP
-      WHERE telegram_id=?
-    `)
-    .bind(
-      blockedUntil,
-      telegramId
-    )
-    .run();
-  }
-
-  await notifyBlock(
-    env,
-    telegramId,
-    days
-  );
-
-  await editMessage(
-    env,
-    query,
-    "✅ User restriction updated.",
-    ADMIN_BACK
-  );
-}
-
-async function unblockUser(
-  env,
-  query,
-  telegramId
-) {
-
-  await env.DB.prepare(`
-    UPDATE suspicious_users
-    SET permanent=0,
-        blocked_until=NULL,
-        updated_at=CURRENT_TIMESTAMP
-    WHERE telegram_id=?
-  `)
-  .bind(telegramId)
-  .run();
-
-  await telegram(
-    env,
-    "sendMessage",
-    {
-      chat_id:
-        telegramId,
-      text:
-        "🔓 Your access to PAYTON has been restored.",
-      reply_markup:
-        MENU
-    }
-  );
-
-  await editMessage(
-    env,
-    query,
-    "✅ User unblocked.",
-    ADMIN_BACK
-  );
-}
-
-async function blockSuspiciousUser(
-  env,
-  query,
-  telegramId,
-  days
-) {
-
-  await blockUser(
-    env,
-    query,
-    telegramId,
-    days
-  );
-}
-
-async function unblockSuspiciousUser(
-  env,
-  query,
-  telegramId
-) {
-
-  await unblockUser(
-    env,
-    query,
-    telegramId
-  );
-}
-
-async function notifyBlock(
-  env,
-  telegramId,
-  days
-) {
-
-  const text =
-    days === "permanent"
-      ? "🚫 Your access to PAYTON has been permanently restricted."
-      : `⏳ Your access to PAYTON has been restricted for ${days} day(s).`;
-
-  await telegram(
-    env,
-    "sendMessage",
-    {
-      chat_id:
-        telegramId,
-      text
-    }
-  );
-}
-
-async function getUserRestriction(
-  env,
-  telegramId
-) {
-
-  const row =
-    await env.DB.prepare(`
-      SELECT *
-      FROM suspicious_users
-      WHERE telegram_id=?
-      LIMIT 1
-    `)
-    .bind(
-      String(telegramId)
-    )
-    .first();
-
-  if (!row) {
     return null;
   }
 
-  if (
-    Number(row.permanent) === 1
-  ) {
-    return row;
-  }
+  const patterns = [
+    /\border[\s:_#-]*(\d+)\b/i,
+    /\bpayton[\s:_#-]*(\d+)\b/i,
+    /\bptn[\s:_#-]*(\d+)\b/i,
+    /\bpresale[\s:_#-]*(\d+)\b/i,
+    /#[\s]*(\d+)\b/i
+  ];
 
-  if (row.blocked_until) {
+  for (const pattern of patterns) {
+    const match = text.match(pattern);
 
-    const time =
-      Date.parse(
-        row.blocked_until
-      );
-
-    if (
-      Number.isFinite(time) &&
-      time > Date.now()
-    ) {
-
-      return row;
+    if (match) {
+      return Number(match[1]);
     }
-
-    await env.DB.prepare(`
-      UPDATE suspicious_users
-      SET blocked_until=NULL,
-          updated_at=CURRENT_TIMESTAMP
-      WHERE telegram_id=?
-    `)
-    .bind(
-      String(telegramId)
-    )
-    .run();
   }
 
   return null;
 }
 
-async function sendBlockedMessage(
-  env,
-  telegramId,
-  restriction
-) {
+async function getTonClient(env) {
+  const apiKey = requireEnv(env, "TONCENTER_API_KEY");
 
-  await telegram(
-    env,
-    "sendMessage",
-    {
-      chat_id:
-        telegramId,
-      text:
-        "🚫 Your access to PAYTON is currently restricted.\n\n" +
-        getBlockStatusText(
-          restriction
-        )
-    }
-  );
+  return new TonClient({
+    endpoint: "https://toncenter.com/api/v2/jsonRPC",
+    apiKey,
+    timeout: 30000
+  });
 }
 
-function getBlockStatusText(
-  row
-) {
+async function deriveSenderWallet(env) {
+  const mnemonic = requireEnv(env, "PTN_MNEMONIC");
 
-  if (
-    Number(row.permanent) === 1
-  ) {
+  const words = mnemonic.split(/\s+/);
 
-    return "Permanent restriction.";
-  }
-
-  if (row.blocked_until) {
-
-    return `Restricted until ${row.blocked_until}.`;
-  }
-
-  return "No active restriction.";
-}
-
-/* =========================================================
-   ADMIN USERS
-========================================================= */
-
-async function showAdminUsers(
-  env,
-  query
-) {
-
-  const rows =
-    await env.DB.prepare(`
-      SELECT *
-      FROM users
-      ORDER BY rowid DESC
-      LIMIT 30
-    `)
-    .all();
-
-  const buttons = [];
-
-  for (
-    const row of
-    rows.results || []
-  ) {
-
-    buttons.push([
-      {
-        text:
-          `👤 ${shortText(
-            row.username ||
-            row.telegram_id,
-            30
-          )}`,
-        callback_data:
-          `admin_user_${row.telegram_id}`
-      }
-    ]);
-  }
-
-  buttons.push([
-    {
-      text:
-        "⬅️ Admin Panel",
-      callback_data:
-        "admin_home"
-    }
-  ]);
-
-  await editMessage(
-    env,
-    query,
-    "👥 Users",
-    {
-      inline_keyboard:
-        buttons
-    }
-  );
-}
-
-async function showAdminUser(
-  env,
-  query,
-  telegramId
-) {
-
-  const user =
-    await env.DB.prepare(`
-      SELECT *
-      FROM users
-      WHERE telegram_id=?
-      LIMIT 1
-    `)
-    .bind(telegramId)
-    .first();
-
-  const orders =
-    await env.DB.prepare(`
-      SELECT *
-      FROM orders
-      WHERE telegram_id=?
-      ORDER BY id DESC
-      LIMIT 10
-    `)
-    .bind(telegramId)
-    .all();
-
-  const text =
-    "👤 User\n\n" +
-    `Username: ${user?.username || "No username"}\n` +
-    `Telegram ID: ${telegramId}\n\n` +
-    `Orders: ${orders.results?.length || 0}`;
-
-  await editMessage(
-    env,
-    query,
-    text,
-    {
-      inline_keyboard: [
-        [
-          {
-            text:
-              "⬅️ Users",
-            callback_data:
-              "admin_users"
-          }
-        ]
-      ]
-    }
-  );
-}
-
-/* =========================================================
-   ADMIN DASHBOARD
-========================================================= */
-
-async function showAdminDashboard(
-  env,
-  query
-) {
-
-  const stats =
-    await getAdminStats(env);
-
-  const text =
-    "📊 PAYTON Dashboard\n\n" +
-    `Users: ${stats.users}\n` +
-    `Orders: ${stats.orders}\n` +
-    `Pending: ${stats.pending}\n` +
-    `Suspicious: ${stats.suspicious}\n` +
-    `Blocked: ${stats.blocked}\n` +
-    `Revenue: ${formatNumber(stats.revenue)} GRAM\n` +
-    `PTN sold: ${formatNumber(stats.ptn)}`;
-
-  await editMessage(
-    env,
-    query,
-    text,
-    await getAdminMenu(env)
-  );
-}
-
-async function getAdminStats(
-  env
-) {
-
-  const users =
-    await env.DB.prepare(`
-      SELECT COUNT(*) AS count
-      FROM users
-    `)
-    .first();
-
-  const orders =
-    await env.DB.prepare(`
-      SELECT COUNT(*) AS count
-      FROM orders
-    `)
-    .first();
-
-  const pending =
-    await env.DB.prepare(`
-      SELECT COUNT(*) AS count
-      FROM orders
-      WHERE status IN (
-        'pending',
-        'payment_verified'
-      )
-    `)
-    .first();
-
-  const suspicious =
-    await env.DB.prepare(`
-      SELECT COUNT(*) AS count
-      FROM suspicious_users
-    `)
-    .first();
-
-  const blocked =
-    await env.DB.prepare(`
-      SELECT COUNT(*) AS count
-      FROM suspicious_users
-      WHERE permanent=1
-         OR (
-           blocked_until IS NOT NULL
-           AND blocked_until >
-             CURRENT_TIMESTAMP
-         )
-    `)
-    .first();
-
-  const revenue =
-    await env.DB.prepare(`
-      SELECT
-        COALESCE(
-          SUM(
-            CAST(
-              gram_amount AS REAL
-            )
-          ),
-          0
-        ) AS total
-      FROM orders
-      WHERE status IN (
-        'payment_verified',
-        'processing',
-        'payout_sent',
-        'completed'
-      )
-    `)
-    .first();
-
-  const ptn =
-    await env.DB.prepare(`
-      SELECT
-        COALESCE(
-          SUM(
-            CAST(
-              ptn_amount AS REAL
-            )
-          ),
-          0
-        ) AS total
-      FROM orders
-      WHERE status IN (
-        'payment_verified',
-        'processing',
-        'payout_sent',
-        'completed'
-      )
-    `)
-    .first();
-
-  return {
-    users:
-      users?.count || 0,
-
-    orders:
-      orders?.count || 0,
-
-    pending:
-      pending?.count || 0,
-
-    suspicious:
-      suspicious?.count || 0,
-
-    blocked:
-      blocked?.count || 0,
-
-    revenue:
-      revenue?.total || 0,
-
-    ptn:
-      ptn?.total || 0
-  };
-}
-
-async function showAdminOrders(
-  env,
-  query
-) {
-
-  const rows =
-    await env.DB.prepare(`
-      SELECT *
-      FROM orders
-      ORDER BY id DESC
-      LIMIT 25
-    `)
-    .all();
-
-  let text =
-    "📋 Recent Orders\n\n";
-
-  for (
-    const row of
-    rows.results || []
-  ) {
-
-    text +=
-      `#${row.id} | ${row.telegram_id}\n` +
-      `GRAM: ${row.gram_amount}\n` +
-      `PTN: ${row.ptn_amount}\n` +
-      `Status: ${displayStatus(row.status)}\n` +
-      `Date: ${row.created_at}\n` +
-      (
-        row.payout_tx_hash
-          ? `Payout TX: ${row.payout_tx_hash}\n`
-          : ""
-      ) +
-      "\n";
-  }
-
-  if (
-    !rows.results?.length
-  ) {
-
-    text +=
-      "No orders found.";
-  }
-
-  await editMessage(
-    env,
-    query,
-    shortText(
-      text,
-      3900
-    ),
-    ADMIN_BACK
-  );
-}
-
-async function showAdminPending(
-  env,
-  query
-) {
-
-  const rows =
-    await env.DB.prepare(`
-      SELECT *
-      FROM orders
-      WHERE status IN (
-        'pending',
-        'payment_verified',
-        'processing',
-        'suspicious'
-      )
-      ORDER BY id ASC
-      LIMIT 25
-    `)
-    .all();
-
-  let text =
-    "⏳ Pending / Under Review\n\n";
-
-  for (
-    const row of
-    rows.results || []
-  ) {
-
-    text +=
-      `#${row.id}\n` +
-      `User: ${row.telegram_id}\n` +
-      `GRAM: ${row.gram_amount}\n` +
-      `PTN: ${row.ptn_amount}\n` +
-      `Status: ${displayStatus(row.status)}\n\n`;
-  }
-
-  if (
-    !rows.results?.length
-  ) {
-
-    text +=
-      "No pending orders.";
-  }
-
-  await editMessage(
-    env,
-    query,
-    shortText(
-      text,
-      3900
-    ),
-    ADMIN_BACK
-  );
-}
-
-async function showAdminRevenue(
-  env,
-  query
-) {
-
-  const row =
-    await env.DB.prepare(`
-      SELECT
-        COALESCE(
-          SUM(
-            CAST(
-              gram_amount AS REAL
-            )
-          ),
-          0
-        ) AS gram,
-
-        COALESCE(
-          SUM(
-            CAST(
-              ptn_amount AS REAL
-            )
-          ),
-          0
-        ) AS ptn,
-
-        COUNT(*) AS orders
-
-      FROM orders
-
-      WHERE status IN (
-        'payment_verified',
-        'processing',
-        'payout_sent',
-        'completed'
-      )
-    `)
-    .first();
-
-  const text =
-    "💰 Revenue\n\n" +
-    `Completed/verified orders: ${row?.orders || 0}\n\n` +
-    `GRAM received: ${formatNumber(row?.gram || 0)}\n` +
-    `PTN sold: ${formatNumber(row?.ptn || 0)}`;
-
-  await editMessage(
-    env,
-    query,
-    text,
-    ADMIN_BACK
-  );
-}
-
-/* =========================================================
-   USERS / ORDERS
-========================================================= */
-
-async function upsertUser(
-  env,
-  user
-) {
-
-  if (!user?.id) {
-    return;
-  }
-
-  await env.DB.prepare(`
-    INSERT INTO users
-    (
-      telegram_id,
-      username
-    )
-    VALUES (?, ?)
-
-    ON CONFLICT(telegram_id)
-    DO UPDATE SET
-      username=excluded.username
-  `)
-  .bind(
-    String(user.id),
-    user.username
-      ? `@${user.username}`
-      : null
-  )
-  .run();
-}
-
-async function createInitialOrder(
-  env,
-  telegramId
-) {
-
-  await env.DB.prepare(`
-    INSERT INTO orders
-    (
-      telegram_id,
-      gram_amount,
-      ptn_amount,
-      payment_address,
-      transaction_hash,
-      status
-    )
-    VALUES (?, ?, ?, ?, ?, ?)
-  `)
-  .bind(
-    String(telegramId),
-    "0",
-    "0",
-    null,
-    null,
-    "awaiting_amount"
-  )
-  .run();
-}
-
-async function getPendingOrder(
-  env,
-  telegramId
-) {
-
-  return await env.DB.prepare(`
-    SELECT *
-    FROM orders
-    WHERE telegram_id=?
-      AND status IN (
-        'awaiting_amount',
-        'awaiting_wallet'
-      )
-    ORDER BY id DESC
-    LIMIT 1
-  `)
-  .bind(
-    String(telegramId)
-  )
-  .first();
-}
-
-/* =========================================================
-   ORDER INPUT
-========================================================= */
-
-async function handleOrderText(
-  message,
-  order,
-  env
-) {
-
-  const telegramId =
-    String(
-      message.from.id
-    );
-
-  const text =
-    String(
-      message.text || ""
-    ).trim();
-
-  if (!text) {
-    return;
-  }
-
-  if (
-    order.status ===
-    "awaiting_amount"
-  ) {
-
-    const gram =
-      parseGramAmount(text);
-
-    if (
-      gram === null ||
-      Number(gram) <= 0
-    ) {
-
-      await telegram(
-        env,
-        "sendMessage",
-        {
-          chat_id:
-            telegramId,
-          text:
-            "❌ Invalid GRAM amount.\n\n" +
-            "Please enter a valid number, for example:\n10",
-          reply_markup:
-            BACK
-        }
-      );
-
-      return;
-    }
-
-    const ptn =
-      gramToPtn(gram);
-
-    await env.DB.prepare(`
-      UPDATE orders
-      SET gram_amount=?,
-          ptn_amount=?,
-          status='awaiting_wallet'
-      WHERE id=?
-    `)
-    .bind(
-      gram,
-      ptn,
-      order.id
-    )
-    .run();
-
-    await telegram(
-      env,
-      "sendMessage",
-      {
-        chat_id:
-          telegramId,
-        text:
-          "✅ Order created.\n\n" +
-          `Payment: ${formatNumber(gram)} GRAM\n` +
-          `You receive: ${formatNumber(ptn)} PTN\n\n` +
-          "Please send your PTN receiving wallet address.",
-        reply_markup:
-          BACK
-      }
-    );
-
-    return;
-  }
-
-  if (
-    order.status ===
-    "awaiting_wallet"
-  ) {
-
-    let wallet;
-
-    try {
-
-      wallet =
-        Address.parse(text)
-          .toString();
-
-    } catch {
-
-      await telegram(
-        env,
-        "sendMessage",
-        {
-          chat_id:
-            telegramId,
-          text:
-            "❌ Invalid TON wallet address.\n\n" +
-            "Please send a valid TON wallet address.",
-          reply_markup:
-            BACK
-        }
-      );
-
-      return;
-    }
-
-    await env.DB.prepare(`
-      UPDATE orders
-      SET payment_address=?,
-          status='pending'
-      WHERE id=?
-    `)
-    .bind(
-      wallet,
-      order.id
-    )
-    .run();
-
-    await telegram(
-      env,
-      "sendMessage",
-      {
-        chat_id:
-          telegramId,
-        text:
-          "✅ Wallet saved.\n\n" +
-          `Order #${order.id}\n` +
-          `Payment amount: ${formatNumber(order.gram_amount)} GRAM\n` +
-          `PTN amount: ${formatNumber(order.ptn_amount)} PTN\n\n` +
-          "Please send the exact GRAM amount to the payment address below:\n\n" +
-          `${GRAM_RECEIVING_WALLET}\n\n` +
-          "Payment comment:\n" +
-          `PAYTON-${order.id}\n\n` +
-          "After sending the payment, the bot will automatically check the blockchain.",
-        reply_markup:
-          BACK
-      }
-    );
-
-    return;
-  }
-}
-
-/* =========================================================
-   USER ORDERS
-========================================================= */
-
-async function showUserOrders(
-  env,
-  query
-) {
-
-  const telegramId =
-    String(
-      query.from.id
-    );
-
-  const rows =
-    await env.DB.prepare(`
-      SELECT *
-      FROM orders
-      WHERE telegram_id=?
-      ORDER BY id DESC
-      LIMIT 10
-    `)
-    .bind(telegramId)
-    .all();
-
-  let text =
-    "📋 My Orders\n\n";
-
-  if (
-    !rows.results?.length
-  ) {
-
-    text +=
-      "You do not have any orders yet.";
-
-  } else {
-
-    for (
-      const row of
-      rows.results
-    ) {
-
-      text +=
-        `Order #${row.id}\n` +
-        `GRAM: ${formatNumber(row.gram_amount)}\n` +
-        `PTN: ${formatNumber(row.ptn_amount)}\n` +
-        `Status: ${displayStatus(row.status)}\n` +
-        (
-          row.payout_tx_hash
-            ? `Payout TX: ${row.payout_tx_hash}\n`
-            : ""
-        ) +
-        `Date: ${row.created_at}\n\n`;
-    }
-  }
-
-  await editMessage(
-    env,
-    query,
-    text,
-    BACK
-  );
-}
-
-/* =========================================================
-   ORDER PROCESSOR
-========================================================= */
-
-async function processOrders(
-  env
-) {
-
-  const rows =
-    await env.DB.prepare(`
-      SELECT *
-      FROM orders
-      WHERE status IN (
-        'pending',
-        'payment_verified'
-      )
-      ORDER BY id ASC
-      LIMIT 1
-    `)
-    .all();
-
-  for (
-    const order of
-    rows.results || []
-  ) {
-
-    try {
-
-      if (
-        order.status ===
-        "pending"
-      ) {
-
-        const payment =
-          await findPayment(
-            env,
-            order
-          );
-
-        if (!payment) {
-          continue;
-        }
-
-        const alreadyUsed =
-          await env.DB.prepare(`
-            SELECT *
-            FROM orders
-            WHERE transaction_hash=?
-              AND id!=?
-            LIMIT 1
-          `)
-          .bind(
-            payment.hash,
-            order.id
-          )
-          .first();
-
-        if (alreadyUsed) {
-
-          const user =
-            await env.DB.prepare(`
-              SELECT username
-              FROM users
-              WHERE telegram_id=?
-              LIMIT 1
-            `)
-            .bind(
-              order.telegram_id
-            )
-            .first();
-
-          await flagSuspicious(
-            env,
-            order.telegram_id,
-            user?.username || null,
-            "Reused transaction hash on another order"
-          );
-
-          await env.DB.prepare(`
-            UPDATE orders
-            SET transaction_hash=?,
-                status='suspicious'
-            WHERE id=?
-          `)
-          .bind(
-            payment.hash,
-            order.id
-          )
-          .run();
-
-          await telegram(
-            env,
-            "sendMessage",
-            {
-              chat_id:
-                order.telegram_id,
-              text:
-                "⚠️ This transaction has already been used.\n\n" +
-                "Your order has been flagged for review.\n\n" +
-                "Please do not send another payment."
-            }
-          );
-
-          await telegram(
-            env,
-            "sendMessage",
-            {
-              chat_id:
-                ADMIN_TELEGRAM_ID,
-              text:
-                "🚨 Suspicious activity detected.\n\n" +
-                `User: ${order.telegram_id}\n` +
-                `Order: #${order.id}\n` +
-                "Reason: Reused transaction hash",
-              reply_markup: {
-                inline_keyboard: [
-                  [
-                    {
-                      text:
-                        "🚨 Review User",
-                      callback_data:
-                        `admin_sus_${order.telegram_id}`
-                    }
-                  ]
-                ]
-              }
-            }
-          );
-
-          continue;
-        }
-
-        await env.DB.prepare(`
-          UPDATE orders
-          SET transaction_hash=?,
-              status='payment_verified'
-          WHERE id=?
-        `)
-        .bind(
-          payment.hash,
-          order.id
-        )
-        .run();
-
-        await telegram(
-          env,
-          "sendMessage",
-          {
-            chat_id:
-              order.telegram_id,
-            text:
-              "✅ Payment verified successfully.\n\n" +
-              `Order #${order.id}\n` +
-              `GRAM received: ${formatNumber(order.gram_amount)}\n` +
-              `PTN amount: ${formatNumber(order.ptn_amount)}\n\n` +
-              "Your PTN tokens are now being sent automatically."
-          }
-        );
-      }
-
-      if (
-        order.status ===
-        "payment_verified"
-      ) {
-
-        const freshOrder =
-          await env.DB.prepare(`
-            SELECT *
-            FROM orders
-            WHERE id=?
-            LIMIT 1
-          `)
-          .bind(order.id)
-          .first();
-
-        if (!freshOrder) {
-          continue;
-        }
-
-        const payout =
-          await sendPTN(
-            env,
-            freshOrder
-          );
-
-        if (
-          payout?.success
-        ) {
-
-          await env.DB.prepare(`
-            UPDATE orders
-            SET status='payout_sent',
-                payout_tx_hash=?
-            WHERE id=?
-          `)
-          .bind(
-            payout.hash || null,
-            order.id
-          )
-          .run();
-
-          await telegram(
-            env,
-            "sendMessage",
-            {
-              chat_id:
-                order.telegram_id,
-              text:
-                "🎉 Order completed successfully!\n\n" +
-                `Order #${order.id}\n` +
-                `${formatNumber(order.ptn_amount)} PTN has been sent to your wallet.\n\n` +
-                "Transaction:\n" +
-                (
-                  payout.hash ||
-                  "Confirmed on blockchain"
-                )
-            }
-          );
-        }
-      }
-
-    } catch (error) {
-
-      console.error(
-        `ORDER ${order.id} ERROR: ${
-          error?.name ||
-          "Error"
-        }: ${
-          error?.message ||
-          String(error)
-        }`
-      );
-    }
-  }
-}
-
-/* =========================================================
-   PAYMENT CHECK
-========================================================= */
-
-async function findPayment(
-  env,
-  order
-) {
-
-  if (!order.payment_address) {
-    return null;
-  }
-
-  const apiKey =
-    env.TONCENTER_API_KEY;
-
-  if (!apiKey) {
-
-    console.error(
-      "TONCENTER_API_KEY missing"
-    );
-
-    return null;
-  }
-
-  const expectedAmount =
-    BigInt(
-      gramToNano(
-        order.gram_amount
-      )
-    );
-
-  const orderCreatedUtime =
-    getOrderCreatedUtime(
-      order.created_at
-    );
-
-  if (
-    orderCreatedUtime ===
-    null
-  ) {
-
-    console.error(
-      `ORDER ${order.id}: invalid created_at`
-    );
-
-    return null;
-  }
-
-  const startUtime =
-    Math.max(
-      0,
-      orderCreatedUtime - 30
-    );
-
-  const endUtime =
-    Math.floor(
-      Date.now() / 1000
-    ) + 60;
-
-  const pageSize = 1000;
-  let offset = 0;
-
-  while (true) {
-
-    const params =
-      new URLSearchParams();
-
-    params.set(
-      "destination",
-      GRAM_RECEIVING_WALLET
-    );
-
-    params.set(
-      "source",
-      order.payment_address
-    );
-
-    params.set(
-      "direction",
-      "in"
-    );
-
-    params.set(
-      "exclude_externals",
-      "true"
-    );
-
-    params.set(
-      "start_utime",
-      String(startUtime)
-    );
-
-    params.set(
-      "end_utime",
-      String(endUtime)
-    );
-
-    params.set(
-      "limit",
-      String(pageSize)
-    );
-
-    params.set(
-      "offset",
-      String(offset)
-    );
-
-    params.set(
-      "sort",
-      "asc"
-    );
-
-    const url =
-      "https://toncenter.com/api/v3/messages?" +
-      params.toString();
-
-    let response;
-
-    try {
-
-      response =
-        await fetch(
-          url,
-          {
-            headers: {
-              "X-API-Key":
-                apiKey
-            }
-          }
-        );
-
-    } catch (error) {
-
-      console.error(
-        `TONCENTER FETCH ERROR ORDER ${order.id}:`,
-        error
-      );
-
-      return null;
-    }
-
-    if (!response.ok) {
-
-      console.error(
-        `TONCENTER ERROR ORDER ${order.id}:`,
-        response.status
-      );
-
-      return null;
-    }
-
-    let data;
-
-    try {
-
-      data =
-        await response.json();
-
-    } catch (error) {
-
-      console.error(
-        `TONCENTER JSON ERROR ORDER ${order.id}:`,
-        error
-      );
-
-      return null;
-    }
-
-    const messages =
-      Array.isArray(
-        data?.messages
-      )
-        ? data.messages
-        : [];
-
-    if (!messages.length) {
-      return null;
-    }
-
-    for (
-      const message of
-      messages
-    ) {
-
-      const source =
-        message?.source || "";
-
-      const destination =
-        message?.destination || "";
-
-      if (
-        !sameAddress(
-          source,
-          order.payment_address
-        )
-      ) {
-        continue;
-      }
-
-      if (
-        !sameAddress(
-          destination,
-          GRAM_RECEIVING_WALLET
-        )
-      ) {
-        continue;
-      }
-
-      if (
-        message?.bounced === true ||
-        message?.bounce === true
-      ) {
-        continue;
-      }
-
-      const value =
-        String(
-          message?.value ?? ""
-        );
-
-      if (!value) {
-        continue;
-      }
-
-      let actualValue;
-
-      try {
-
-        actualValue =
-          BigInt(value);
-
-      } catch {
-
-        continue;
-      }
-
-      if (
-        actualValue !==
-        expectedAmount
-      ) {
-        continue;
-      }
-
-      const hash =
-        message?.in_msg_tx_hash ||
-        message?.transaction_hash ||
-        "";
-
-      if (!hash) {
-        continue;
-      }
-
-      const body =
-        message?.message_content?.body ||
-        message?.message_content?.body_boc ||
-        message?.msg_data ||
-        message?.message_data ||
-        null;
-
-      const comment =
-        decodeComment(body);
-
-      if (
-        comment !==
-        `PAYTON-${order.id}`
-      ) {
-        continue;
-      }
-
-      const messageUtime =
-        Number(
-          message?.created_at ||
-          0
-        );
-
-      if (
-        messageUtime &&
-        messageUtime <
-          startUtime
-      ) {
-        continue;
-      }
-
-      const existing =
-        await env.DB.prepare(`
-          SELECT id
-          FROM orders
-          WHERE transaction_hash=?
-          LIMIT 1
-        `)
-        .bind(hash)
-        .first();
-
-      if (existing) {
-
-        return {
-          hash,
-          duplicate: true
-        };
-      }
-
-      console.log(
-        `PAYMENT FOUND ORDER ${order.id}: ${hash}`
-      );
-
-      return {
-        hash
-      };
-    }
-
-    if (
-      messages.length <
-      pageSize
-    ) {
-      return null;
-    }
-
-    offset += pageSize;
-  }
-}
-
-/* =========================================================
-   TON MNEMONIC -> KEYPAIR
-========================================================= */
-
-async function derivePTNKeyPair(
-  env
-) {
-
-  const mnemonic =
-    String(
-      env.PTN_MNEMONIC || ""
-    ).trim();
-
-  if (!mnemonic) {
-
-    throw new Error(
-      "PTN_MNEMONIC missing"
-    );
-  }
-
-  const words =
-    mnemonic.split(/\s+/);
-
-  if (
-    words.length !== 12 &&
-    words.length !== 24
-  ) {
-
+  if (words.length !== 12 && words.length !== 24) {
     throw new Error(
       `PTN_MNEMONIC has invalid word count: ${words.length}`
     );
   }
 
-  return await mnemonicToPrivateKey(
-    words
+  const keyPair = await mnemonicToPrivateKey(words);
+
+  const wallet = WalletContractV5R1.create({
+    workchain: 0,
+    publicKey: keyPair.publicKey,
+    walletId: {
+      networkGlobalId: MAINNET_NETWORK_ID
+    }
+  });
+
+  const configuredAddress = requireEnv(
+    env,
+    "PTN_SENDER_WALLET"
   );
+
+  const derivedAddress = wallet.address.toString({
+    bounceable: false,
+    testOnly: false,
+    urlSafe: true
+  });
+
+  const expectedAddress = Address.parse(
+    configuredAddress
+  ).toString({
+    bounceable: false,
+    testOnly: false,
+    urlSafe: true
+  });
+
+  if (derivedAddress !== expectedAddress) {
+    throw new Error(
+      "Derived sender wallet does not match configured PTN sender wallet"
+    );
+  }
+
+  return {
+    keyPair,
+    wallet
+  };
 }
 
-/* =========================================================
-   PTN PAYOUT
-========================================================= */
+async function toncenterGet(env, path, params) {
+  const apiKey = requireEnv(env, "TONCENTER_API_KEY");
 
-async function sendPTN(
-  env,
-  order
-) {
+  const url = new URL(
+    `https://toncenter.com/api/v3${path}`
+  );
 
-  try {
+  for (const [key, value] of params.entries()) {
+    url.searchParams.set(key, value);
+  }
 
-    if (!order.payment_address) {
+  const response = await fetch(url.toString(), {
+    method: "GET",
+    headers: {
+      "X-API-Key": apiKey,
+      "accept": "application/json"
+    }
+  });
 
-      throw new Error(
-        "Order has no destination wallet"
-      );
+  if (!response.ok) {
+    const body = await response.text().catch(() => "");
+
+    throw new Error(
+      `TONCENTER ERROR ${response.status}: ${body}`
+    );
+  }
+
+  return response.json();
+}
+
+async function findInboundPayment(env, order, ambiguous) {
+  const expectedNano = gramToNano(order.gram_amount);
+
+  const params = new URLSearchParams();
+
+  params.set(
+    "destination",
+    String(order.payment_address)
+  );
+
+  params.set("direction", "in");
+  params.set("exclude_externals", "true");
+  params.set(
+    "start_utime",
+    String(getOrderCreatedUtime(order))
+  );
+  params.set(
+    "limit",
+    String(PAYMENT_LOOKBACK_LIMIT)
+  );
+  params.set("sort", "desc");
+
+  const data = await toncenterGet(
+    env,
+    "/messages",
+    params
+  );
+
+  const messages = Array.isArray(data?.messages)
+    ? data.messages
+    : [];
+
+  for (const message of messages) {
+    if (message?.bounced === true) {
+      continue;
     }
 
-    const keyPair =
-      await derivePTNKeyPair(env);
-
-    const client =
-      new TonClient({
-        endpoint:
-          "https://toncenter.com/api/v2/jsonRPC",
-        apiKey:
-          env.TONCENTER_API_KEY
-      });
-
-    const senderWallet =
-      WalletContractV5R1.create({
-        workchain: 0,
-        publicKey:
-          keyPair.publicKey,
-        walletId: {
-          networkGlobalId: -239
-        }
-      });
-
-    const derivedAddress =
-      normalizeAddress(
-        senderWallet.address
-      );
-
-    const configuredAddress =
-      normalizeAddress(
-        PTN_SENDER_WALLET
-      );
-
-    if (
-      derivedAddress !==
-      configuredAddress
-    ) {
-
-      throw new Error(
-        `Derived wallet ${derivedAddress} does not match PTN_SENDER_WALLET ${configuredAddress}`
-      );
-    }
-
-    const wallet =
-      client.open(
-        senderWallet
-      );
-
-    const deployed =
-      await client.isContractDeployed(
-        senderWallet.address
-      );
-
-    if (!deployed) {
-
-      throw new Error(
-        "PTN sender wallet is not initialized or deployed"
-      );
-    }
-
-    const balance =
-      await client.getBalance(
-        senderWallet.address
-      );
-
-    if (
-      balance <
-      MIN_SENDER_TON_BALANCE
-    ) {
-
-      throw new Error(
-        "Insufficient native TON balance for payout"
-      );
-    }
-
-    const master =
-      client.open(
-        JettonMaster.create(
-          Address.parse(
-            PTN_MASTER
-          )
-        )
-      );
-
-    const senderJettonWallet =
-      client.open(
-        await master.getWalletAddress(
-          senderWallet.address
-        )
-      );
-
-    const senderJettonBalance =
-      await senderJettonWallet.getJettonBalance();
-
-    const amount =
-      decimalToUnits(
-        order.ptn_amount,
-        PTN_DECIMALS
-      );
-
-    if (
-      amount <= 0n
-    ) {
-
-      throw new Error(
-        "Invalid PTN payout amount"
-      );
+    if (message?.bounce === true) {
+      continue;
     }
 
     if (
-      senderJettonBalance <
-      amount
+      !message?.destination ||
+      !sameAddress(
+        message.destination,
+        order.payment_address
+      )
     ) {
-
-      throw new Error(
-        "Insufficient PTN balance"
-      );
+      continue;
     }
 
-    const existing =
-      await findConfirmedJettonPayout(
-        env,
-        senderWallet.address,
-        order,
-        amount
-      );
+    let value;
 
-    if (existing) {
+    try {
+      value = BigInt(String(message?.value ?? "0"));
+    } catch {
+      continue;
+    }
 
-      console.log(
-        `EXISTING PAYOUT FOUND ORDER ${order.id}: ${existing}`
-      );
+    if (value !== expectedNano) {
+      continue;
+    }
 
+    const comment = decodeComment(
+      message?.message_content?.body || ""
+    );
+
+    const commentOrderId =
+      extractOrderIdFromComment(comment);
+
+    if (commentOrderId === order.id) {
       return {
-        success: true,
-        hash: existing
+        txHash:
+          message?.in_msg_tx_hash ||
+          message?.out_msg_tx_hash ||
+          message?.hash ||
+          "",
+        source: message?.source || "",
+        destination: message.destination,
+        value,
+        comment
       };
     }
 
-    const destination =
-      Address.parse(
-        order.payment_address
-      );
-
-    const destinationJettonWallet =
-      await master.getWalletAddress(
-        destination
-      );
-
-    const body =
-      beginCell()
-        .storeUint(
-          0x0f8a7ea5,
-          32
-        )
-        .storeUint(
-          BigInt(order.id),
-          64
-        )
-        .storeCoins(
-          amount
-        )
-        .storeAddress(
-          destination
-        )
-        .storeAddress(
-          senderWallet.address
-        )
-        .storeBit(0)
-        .storeCoins(
-          PAYOUT_FORWARD_TON_AMOUNT
-        )
-        .storeBit(0)
-        .endCell();
-
-    const seqno =
-      await wallet.getSeqno();
-
-    console.log(
-      `SENDING PTN ORDER ${order.id}`
-    );
-
-    console.log(
-      `PTN AMOUNT: ${order.ptn_amount}`
-    );
-
-    console.log(
-      `DESTINATION: ${normalizeAddress(destination)}`
-    );
-
-    await wallet.sendTransfer({
-      seqno,
-      secretKey:
-        keyPair.secretKey,
-      sendMode:
-        SendMode.PAY_GAS_SEPARATELY,
-      messages: [
-        internal({
-          to:
-            destinationJettonWallet,
-          value:
-            PAYOUT_MESSAGE_VALUE,
-          body
-        })
-      ]
-    });
-
-    console.log(
-      `PTN PAYOUT BROADCAST ORDER ${order.id}`
-    );
-
-    const confirmedHash =
-      await waitForJettonPayout(
-        env,
-        senderWallet.address,
-        order,
-        amount,
-        8,
-        2500
-      );
-
-    if (!confirmedHash) {
-
-      throw new Error(
-        "PTN transfer was broadcast but blockchain confirmation was not found yet"
-      );
+    if (!comment && !ambiguous) {
+      return {
+        txHash:
+          message?.in_msg_tx_hash ||
+          message?.out_msg_tx_hash ||
+          message?.hash ||
+          "",
+        source: message?.source || "",
+        destination: message.destination,
+        value,
+        comment
+      };
     }
-
-    console.log(
-      `PTN PAYOUT CONFIRMED ORDER ${order.id}: ${confirmedHash}`
-    );
-
-    return {
-      success: true,
-      hash: confirmedHash
-    };
-
-  } catch (error) {
-
-    console.error(
-      `PTN PAYOUT ERROR ORDER ${order.id}: ${
-        error?.name ||
-        "Error"
-      }: ${
-        error?.message ||
-        String(error)
-      }`
-    );
-
-    await env.DB.prepare(`
-      UPDATE orders
-      SET status='payment_verified'
-      WHERE id=?
-        AND status='payment_verified'
-    `)
-    .bind(
-      order.id
-    )
-    .run();
-
-    await telegram(
-      env,
-      "sendMessage",
-      {
-        chat_id:
-          order.telegram_id,
-        text:
-          "⚠️ Your payment has been verified, but the PTN transfer could not be completed yet.\n\n" +
-          "Your payment is safe and the system will retry the PTN transfer automatically."
-      }
-    );
-
-    return {
-      success: false,
-      error:
-        String(error)
-    };
   }
+
+  return null;
 }
 
-/* =========================================================
-   CONFIRMED JETTON PAYOUT CHECK
-========================================================= */
+async function isTransactionAlreadyUsed(env, txHash, orderId) {
+  if (!txHash) {
+    return false;
+  }
+
+  const result = await env.DB.prepare(`
+    SELECT id
+    FROM orders
+    WHERE transaction_hash = ?
+      AND id != ?
+    LIMIT 1
+  `)
+    .bind(txHash, orderId)
+    .first();
+
+  return Boolean(result);
+}
+
+async function markPaymentConfirmed(env, orderId, txHash) {
+  const result = await env.DB.prepare(`
+    UPDATE orders
+    SET status = 'payment_confirmed',
+        transaction_hash = ?
+    WHERE id = ?
+      AND status = 'pending'
+  `)
+    .bind(txHash, orderId)
+    .run();
+
+  return result?.meta?.changes === 1;
+}
+
+async function createPtnTransferBody(
+  order,
+  senderWallet,
+  amount,
+  destination
+) {
+  return beginCell()
+    .storeUint(0x0f8a7ea5, 32)
+    .storeUint(BigInt(order.id), 64)
+    .storeCoins(amount)
+    .storeAddress(destination)
+    .storeAddress(senderWallet.address)
+    .storeBit(0)
+    .storeCoins(FORWARD_TON_AMOUNT)
+    .storeBit(0)
+    .endCell();
+}
 
 async function findConfirmedJettonPayout(
   env,
@@ -3920,211 +494,108 @@ async function findConfirmedJettonPayout(
   order,
   amount
 ) {
+  const ownerAddress = senderOwnerAddress.toString({
+    bounceable: false,
+    testOnly: false,
+    urlSafe: true
+  });
 
-  const apiKey =
-    env.TONCENTER_API_KEY;
+  const jettonMaster = requireEnv(
+    env,
+    "PTN_MASTER"
+  );
 
-  if (!apiKey) {
+  const params = new URLSearchParams();
 
-    console.error(
-      "TONCENTER_API_KEY missing"
-    );
+  params.set("owner_address", ownerAddress);
+  params.set("jetton_master", jettonMaster);
+  params.set("direction", "out");
+  params.set("limit", "100");
+  params.set("sort", "desc");
 
-    return null;
-  }
+  const data = await toncenterGet(
+    env,
+    "/jetton/transfers",
+    params
+  );
 
-  try {
+  const transfers = Array.isArray(
+    data?.jetton_transfers
+  )
+    ? data.jetton_transfers
+    : [];
 
-    const ownerAddress =
-      normalizeAddress(
-        senderOwnerAddress
-      );
-
-    const params =
-      new URLSearchParams();
-
-    params.set(
-      "owner_address",
-      ownerAddress
-    );
-
-    params.set(
-      "jetton_master",
-      PTN_MASTER
-    );
-
-    params.set(
-      "direction",
-      "out"
-    );
-
-    params.set(
-      "limit",
-      "100"
-    );
-
-    params.set(
-      "offset",
-      "0"
-    );
-
-    params.set(
-      "sort",
-      "desc"
-    );
-
-    const url =
-      "https://toncenter.com/api/v3/jetton/transfers?" +
-      params.toString();
-
-    const response =
-      await fetch(
-        url,
-        {
-          headers: {
-            "X-API-Key":
-              apiKey
-          }
-        }
-      );
-
-    if (!response.ok) {
-
-      console.error(
-        `JETTON TRANSFER API ERROR: ${response.status}`
-      );
-
-      return null;
+  for (const transfer of transfers) {
+    if (transfer?.transaction_aborted === true) {
+      continue;
     }
 
-    const data =
-      await response.json();
-
-    const transfers =
-      Array.isArray(
-        data?.jetton_transfers
+    if (
+      !sameAddress(
+        transfer?.jetton_master,
+        jettonMaster
       )
-        ? data.jetton_transfers
-        : [];
-
-    const expectedQueryId =
-      BigInt(
-        String(order.id)
-      );
-
-    const expectedDestination =
-      normalizeAddress(
-        order.payment_address
-      );
-
-    const expectedMaster =
-      normalizeAddress(
-        PTN_MASTER
-      );
-
-    for (
-      const transfer of
-      transfers
     ) {
+      continue;
+    }
 
+    if (
+      !sameAddress(
+        transfer?.destination,
+        order.payout_destination
+      )
+    ) {
+      continue;
+    }
+
+    let queryMatches = false;
+
+    try {
+      queryMatches =
+        BigInt(
+          String(transfer?.query_id ?? "")
+        ) === BigInt(order.id);
+    } catch {
+      queryMatches = false;
+    }
+
+    if (!queryMatches) {
+      continue;
+    }
+
+    try {
       if (
-        transfer?.transaction_aborted ===
-        true
+        BigInt(String(transfer?.amount ?? "")) !==
+        amount
       ) {
         continue;
       }
+    } catch {
+      continue;
+    }
 
-      const queryId =
-        parseBigIntSafe(
-          transfer?.query_id
-        );
+    const hash =
+      transfer?.transaction_hash || "";
 
-      if (
-        queryId === null ||
-        queryId !==
-          expectedQueryId
-      ) {
-        continue;
-      }
-
-      const master =
-        transfer?.jetton_master;
-
-      if (
-        !sameAddress(
-          master,
-          expectedMaster
-        )
-      ) {
-        continue;
-      }
-
-      const destination =
-        transfer?.destination;
-
-      if (
-        !sameAddress(
-          destination,
-          expectedDestination
-        )
-      ) {
-        continue;
-      }
-
-      const transferAmount =
-        parseBigIntSafe(
-          transfer?.amount
-        );
-
-      if (
-        transferAmount === null ||
-        transferAmount !==
-          amount
-      ) {
-        continue;
-      }
-
-      const hash =
-        transfer?.transaction_hash ||
-        "";
-
-      if (!hash) {
-        continue;
-      }
-
+    if (hash) {
       return hash;
     }
-
-  } catch (error) {
-
-    console.error(
-      "JETTON PAYOUT SEARCH ERROR:",
-      error
-    );
   }
 
   return null;
 }
 
-/* =========================================================
-   WAIT FOR JETTON PAYOUT CONFIRMATION
-========================================================= */
-
 async function waitForJettonPayout(
   env,
   senderOwnerAddress,
   order,
-  amount,
-  attempts = 8,
-  delayMs = 2500
+  amount
 ) {
-
   for (
     let attempt = 0;
-    attempt < attempts;
+    attempt < PAYOUT_CONFIRM_ATTEMPTS;
     attempt++
   ) {
-
     const hash =
       await findConfirmedJettonPayout(
         env,
@@ -4139,11 +610,13 @@ async function waitForJettonPayout(
 
     if (
       attempt <
-      attempts - 1
+      PAYOUT_CONFIRM_ATTEMPTS - 1
     ) {
-
-      await sleep(
-        delayMs
+      await new Promise(resolve =>
+        setTimeout(
+          resolve,
+          PAYOUT_CONFIRM_DELAY_MS
+        )
       );
     }
   }
@@ -4151,646 +624,552 @@ async function waitForJettonPayout(
   return null;
 }
 
-/* =========================================================
-   ADMIN STATE
-========================================================= */
-
-async function setAdminState(
+async function sendPtnPayout(
   env,
-  mode,
-  targetId
+  order
 ) {
+  const client = await getTonClient(env);
 
-  await env.DB.prepare(`
-    INSERT INTO admin_states
-    (
-      telegram_id,
-      mode,
-      target_id
-    )
-    VALUES (?, ?, ?)
+  const {
+    keyPair,
+    wallet: senderWallet
+  } = await deriveSenderWallet(env);
 
-    ON CONFLICT(telegram_id)
-    DO UPDATE SET
-      mode=excluded.mode,
-      target_id=excluded.target_id,
-      updated_at=CURRENT_TIMESTAMP
-  `)
-  .bind(
-    ADMIN_TELEGRAM_ID,
-    mode,
-    targetId
-  )
-  .run();
-}
-
-async function getAdminState(
-  env
-) {
-
-  return await env.DB.prepare(`
-    SELECT *
-    FROM admin_states
-    WHERE telegram_id=?
-    LIMIT 1
-  `)
-  .bind(
-    ADMIN_TELEGRAM_ID
-  )
-  .first();
-}
-
-async function clearAdminState(
-  env
-) {
-
-  await env.DB.prepare(`
-    DELETE FROM admin_states
-    WHERE telegram_id=?
-  `)
-  .bind(
-    ADMIN_TELEGRAM_ID
-  )
-  .run();
-}
-
-/* =========================================================
-   HELPERS
-========================================================= */
-
-function parseGramAmount(
-  value
-) {
-
-  const input =
-    String(value)
-      .trim()
-      .replace(",", ".");
-
-  if (
-    !/^\d+(?:\.\d{1,9})?$/.test(
-      input
-    )
-  ) {
-
-    return null;
-  }
-
-  const number =
-    Number(input);
-
-  if (
-    !Number.isFinite(number) ||
-    number <= 0
-  ) {
-
-    return null;
-  }
-
-  return input;
-}
-
-function decimalToUnits(
-  value,
-  decimals
-) {
-
-  const input =
-    String(value)
-      .trim();
-
-  if (
-    !/^\d+(?:\.\d+)?$/.test(
-      input
-    )
-  ) {
-
-    throw new Error(
-      `Invalid decimal value: ${value}`
-    );
-  }
-
-  const parts =
-    input.split(".");
-
-  const whole =
-    parts[0];
-
-  const fraction =
-    parts[1] || "";
-
-  if (
-    fraction.length >
-    decimals
-  ) {
-
-    throw new Error(
-      `Too many decimal places: ${value}`
-    );
-  }
-
-  const padded =
-    fraction
-      .padEnd(
-        decimals,
-        "0"
-      );
-
-  const base =
-    10n ** BigInt(decimals);
-
-  return (
-    BigInt(whole) *
-      base +
-    BigInt(
-      padded || "0"
-    )
+  const destination = Address.parse(
+    order.payout_destination
   );
-}
 
-function unitsToDecimal(
-  units,
-  decimals
-) {
-
-  const base =
-    10n ** BigInt(decimals);
-
-  const whole =
-    units / base;
-
-  const fraction =
-    (
-      units % base
-    )
-      .toString()
-      .padStart(
-        decimals,
-        "0"
-      )
-      .replace(
-        /0+$/,
-        ""
-      );
-
-  if (!fraction) {
-    return whole.toString();
-  }
-
-  return `${whole}.${fraction}`;
-}
-
-function gramToPtn(
-  gram
-) {
-
-  const gramNano =
-    BigInt(
-      gramToNano(gram)
-    );
-
-  const ptnUnits =
-    gramNano *
-    PTN_PER_GRAM;
-
-  return unitsToDecimal(
-    ptnUnits,
+  const amount = decimalToUnits(
+    order.ptn_amount,
     PTN_DECIMALS
   );
-}
 
-function gramToNano(
-  gram
-) {
-
-  const [
-    whole,
-    decimal = ""
-  ] =
-    String(gram).split(".");
-
-  const padded =
-    decimal
-      .padEnd(
-        9,
-        "0"
-      )
-      .slice(
-        0,
-        9
-      );
-
-  return (
-    BigInt(whole) *
-      1000000000n +
-    BigInt(
-      padded || "0"
-    )
-  ).toString();
-}
-
-function formatNumber(
-  value
-) {
-
-  const [
-    whole,
-    decimal
-  ] =
-    String(value).split(".");
-
-  const grouped =
-    whole.replace(
-      /\B(?=(\d{3})+(?!\d))/g,
-      ","
-    );
-
-  return decimal
-    ? `${grouped}.${decimal}`
-    : grouped;
-}
-
-function displayStatus(
-  status
-) {
-
-  const map = {
-    pending:
-      "Pending payment",
-
-    awaiting_amount:
-      "Awaiting amount",
-
-    awaiting_wallet:
-      "Awaiting wallet",
-
-    payment_verified:
-      "Payment verified",
-
-    processing:
-      "Processing",
-
-    payout_sent:
-      "PTN sent",
-
-    completed:
-      "Completed",
-
-    suspicious:
-      "Under review"
-  };
-
-  return (
-    map[status] ||
-    status
-  );
-}
-
-function shortText(
-  text,
-  max
-) {
-
-  const value =
-    String(text || "");
-
-  if (
-    value.length <= max
-  ) {
-
-    return value;
-  }
-
-  return (
-    value.slice(
-      0,
-      max - 1
-    ) + "…"
-  );
-}
-
-function normalizeAddress(
-  value
-) {
-
-  if (!value) {
+  if (amount <= 0n) {
     throw new Error(
-      "Address is empty"
+      `Invalid PTN amount for order ${order.id}`
     );
   }
 
-  const address =
-    typeof value === "string"
-      ? Address.parse(value)
-      : value;
+  const existing =
+    await findConfirmedJettonPayout(
+      env,
+      senderWallet.address,
+      order,
+      amount
+    );
 
-  return address.toString({
-    bounceable: false,
-    testOnly: false,
-    urlSafe: true
+  if (existing) {
+    return {
+      success: true,
+      hash: existing,
+      alreadySent: true
+    };
+  }
+
+  const jettonMaster = client.open(
+    JettonMaster.create(
+      Address.parse(
+        requireEnv(env, "PTN_MASTER")
+      )
+    )
+  );
+
+  const senderJettonWalletAddress =
+    await jettonMaster.getWalletAddress(
+      senderWallet.address
+    );
+
+  const body =
+    await createPtnTransferBody(
+      order,
+      senderWallet,
+      amount,
+      destination
+    );
+
+  const walletContract =
+    client.open(senderWallet);
+
+  const seqno =
+    await walletContract.getSeqno();
+
+  await walletContract.sendTransfer({
+    seqno,
+    secretKey: keyPair.secretKey,
+    messages: [
+      internal({
+        to: senderJettonWalletAddress,
+        value: toNano(PAYOUT_TON_AMOUNT),
+        bounce: true,
+        body
+      })
+    ],
+    sendMode:
+      SendMode.PAY_GAS_SEPARATELY
   });
+
+  const confirmedHash =
+    await waitForJettonPayout(
+      env,
+      senderWallet.address,
+      order,
+      amount
+    );
+
+  if (!confirmedHash) {
+    throw new Error(
+      "PTN transfer was broadcast, but indexed confirmation was not found yet"
+    );
+  }
+
+  return {
+    success: true,
+    hash: confirmedHash,
+    alreadySent: false
+  };
 }
 
-function sameAddress(
-  a,
-  b
+async function sendTelegramMessage(
+  env,
+  chatId,
+  text
 ) {
+  const botToken = requireEnv(
+    env,
+    "TELEGRAM_BOT_TOKEN"
+  );
 
-  if (!a || !b) {
+  const response = await fetch(
+    `https://api.telegram.org/bot${botToken}/sendMessage`,
+    {
+      method: "POST",
+      headers: {
+        "content-type":
+          "application/json"
+      },
+      body: JSON.stringify({
+        chat_id: chatId,
+        text,
+        disable_web_page_preview: true
+      })
+    }
+  );
+
+  if (!response.ok) {
+    const body =
+      await response.text().catch(() => "");
+
+    throw new Error(
+      `TELEGRAM ERROR ${response.status}: ${body}`
+    );
+  }
+}
+
+async function getPendingOrders(env) {
+  const result = await env.DB.prepare(`
+    SELECT
+      id,
+      telegram_id,
+      gram_amount,
+      ptn_amount,
+      payment_address,
+      transaction_hash,
+      status,
+      created_at,
+      payout_tx_hash
+    FROM orders
+    WHERE status IN (
+      'pending',
+      'payment_confirmed',
+      'payout_processing'
+    )
+    ORDER BY id ASC
+    LIMIT ?
+  `)
+    .bind(ORDER_BATCH_SIZE)
+    .all();
+
+  return Array.isArray(result?.results)
+    ? result.results
+    : [];
+}
+
+function buildAmbiguousMap(orders) {
+  const map = new Map();
+
+  for (const order of orders) {
+    if (
+      order.status !== "pending" ||
+      !order.payment_address
+    ) {
+      continue;
+    }
+
+    let key;
+
+    try {
+      key = `${normalizeAddress(
+        order.payment_address
+      )}:${gramToNano(
+        order.gram_amount
+      ).toString()}`;
+    } catch {
+      continue;
+    }
+
+    map.set(
+      key,
+      (map.get(key) || 0) + 1
+    );
+  }
+
+  return map;
+}
+
+async function processPendingOrder(
+  env,
+  order,
+  ambiguousMap
+) {
+  const paymentKey =
+    `${normalizeAddress(
+      order.payment_address
+    )}:${gramToNano(
+      order.gram_amount
+    ).toString()}`;
+
+  const ambiguous =
+    (ambiguousMap.get(paymentKey) || 0) > 1;
+
+  const payment =
+    await findInboundPayment(
+      env,
+      order,
+      ambiguous
+    );
+
+  if (!payment) {
     return false;
   }
 
-  try {
+  if (!payment.txHash) {
+    return false;
+  }
 
-    return (
-      normalizeAddress(a) ===
-      normalizeAddress(b)
+  const alreadyUsed =
+    await isTransactionAlreadyUsed(
+      env,
+      payment.txHash,
+      order.id
     );
 
-  } catch {
-
-    return (
-      String(a).trim() ===
-      String(b).trim()
-    );
-  }
-}
-
-function parseBigIntSafe(
-  value
-) {
-
-  if (
-    value === null ||
-    value === undefined ||
-    value === ""
-  ) {
-
-    return null;
-  }
-
-  try {
-
-    return BigInt(
-      String(value)
+  if (alreadyUsed) {
+    console.warn(
+      "PAYMENT TRANSACTION ALREADY USED:",
+      order.id,
+      payment.txHash
     );
 
-  } catch {
-
-    return null;
-  }
-}
-
-function sleep(
-  ms
-) {
-
-  return new Promise(
-    resolve =>
-      setTimeout(
-        resolve,
-        ms
-      )
-  );
-}
-
-function getOrderCreatedUtime(
-  value
-) {
-
-  if (!value) {
-    return null;
+    return false;
   }
 
-  const normalized =
-    String(value)
-      .replace(
-        " ",
-        "T"
-      );
-
-  const time =
-    Date.parse(
-      normalized +
-      (
-        normalized.endsWith("Z")
-          ? ""
-          : "Z"
-      )
-    );
-
-  if (
-    Number.isNaN(time)
-  ) {
-
-    return null;
-  }
-
-  return Math.floor(
-    time / 1000
-  );
-}
-
-/* =========================================================
-   COMMENT DECODER
-========================================================= */
-
-function decodeComment(
-  msgData
-) {
-
-  if (!msgData) {
-    return "";
-  }
-
-  try {
-
-    if (
-      typeof msgData !==
-      "string"
-    ) {
-
-      return "";
-    }
-
-    const cell =
-      Cell.fromBase64(
-        msgData
-      );
-
-    const bytes = [];
-
-    readCommentCell(
-      cell,
-      bytes
-    );
-
-    return new TextDecoder()
-      .decode(
-        new Uint8Array(bytes)
-      )
-      .replace(
-        /\0+$/,
-        ""
-      );
-
-  } catch {
-
-    return "";
-  }
-}
-
-function readCommentCell(
-  cell,
-  bytes
-) {
-
-  const slice =
-    cell.beginParse();
-
-  if (
-    slice.remainingBits <
-    32
-  ) {
-
-    return;
-  }
-
-  const opcode =
-    slice.loadUint(32);
-
-  if (
-    opcode !== 0
-  ) {
-
-    return;
-  }
-
-  while (
-    slice.remainingBits >=
-    8
-  ) {
-
-    bytes.push(
-      slice.loadUint(8)
-    );
-  }
-
-  while (
-    slice.remainingRefs > 0
-  ) {
-
-    readSnakeCommentCell(
-      slice.loadRef(),
-      bytes
-    );
-  }
-}
-
-function readSnakeCommentCell(
-  cell,
-  bytes
-) {
-
-  const slice =
-    cell.beginParse();
-
-  while (
-    slice.remainingBits >=
-    8
-  ) {
-
-    bytes.push(
-      slice.loadUint(8)
-    );
-  }
-
-  while (
-    slice.remainingRefs > 0
-  ) {
-
-    readSnakeCommentCell(
-      slice.loadRef(),
-      bytes
-    );
-  }
-}
-
-/* =========================================================
-   TELEGRAM
-========================================================= */
-
-async function telegram(
-  env,
-  method,
-  body
-) {
-
-  const token =
-    env.BOT_TOKEN;
-
-  if (!token) {
-
+  if (!payment.source) {
     console.error(
-      "BOT_TOKEN missing"
+      "PAYMENT SOURCE MISSING:",
+      order.id
     );
 
-    return null;
+    return false;
   }
 
-  const response =
-    await fetch(
-      `https://api.telegram.org/bot${token}/${method}`,
-      {
-        method:
-          "POST",
-        headers: {
-          "content-type":
-            "application/json"
-        },
-        body:
-          JSON.stringify(body)
-      }
+  const claimed =
+    await markPaymentConfirmed(
+      env,
+      order.id,
+      payment.txHash
     );
+
+  if (!claimed) {
+    return false;
+  }
+
+  order.status = "payment_confirmed";
+  order.transaction_hash =
+    payment.txHash;
+
+  order.payout_destination =
+    payment.source;
+
+  console.log(
+    "PAYMENT CONFIRMED:",
+    {
+      orderId: order.id,
+      txHash: payment.txHash,
+      source: payment.source,
+      gramAmount: order.gram_amount,
+      ptnAmount: order.ptn_amount
+    }
+  );
 
   try {
-
-    return await response.json();
-
-  } catch {
-
-    return null;
+    await sendTelegramMessage(
+      env,
+      order.telegram_id,
+      `Payment confirmed for Order #${order.id}.\n\nGRAM: ${order.gram_amount}\nPTN: ${order.ptn_amount}\n\nPTN payout is being processed.`
+    );
+  } catch (error) {
+    console.error(
+      "PAYMENT TELEGRAM ERROR:",
+      error
+    );
   }
+
+  return true;
 }
 
-async function editMessage(
+async function claimPayoutProcessing(
   env,
-  query,
-  text,
-  replyMarkup
+  orderId
 ) {
+  const result = await env.DB.prepare(`
+    UPDATE orders
+    SET status = 'payout_processing'
+    WHERE id = ?
+      AND status = 'payment_confirmed'
+  `)
+    .bind(orderId)
+    .run();
 
-  const message =
-    query.message;
+  return result?.meta?.changes === 1;
+}
 
-  if (!message) {
+async function markPayoutSent(
+  env,
+  orderId,
+  payoutHash
+) {
+  const result = await env.DB.prepare(`
+    UPDATE orders
+    SET status = 'payout_sent',
+        payout_tx_hash = ?
+    WHERE id = ?
+      AND status = 'payout_processing'
+  `)
+    .bind(payoutHash, orderId)
+    .run();
+
+  return result?.meta?.changes === 1;
+}
+
+async function processPayoutOrder(
+  env,
+  order
+) {
+  if (
+    order.status !==
+      "payment_confirmed" &&
+    order.status !==
+      "payout_processing"
+  ) {
     return;
   }
 
-  await telegram(
-    env,
-    "editMessageText",
+  if (!order.payout_destination) {
+    if (!order.transaction_hash) {
+      throw new Error(
+        `Order ${order.id} has no payment transaction hash`
+      );
+    }
+
+    const paymentAddress =
+      Address.parse(
+        order.payment_address
+      );
+
+    const paymentParams =
+      new URLSearchParams();
+
+    paymentParams.set(
+      "msg_hash",
+      order.transaction_hash
+    );
+
+    const paymentData =
+      await toncenterGet(
+        env,
+        "/messages",
+        paymentParams
+      );
+
+    const paymentMessages =
+      Array.isArray(
+        paymentData?.messages
+      )
+        ? paymentData.messages
+        : [];
+
+    let source = "";
+
+    for (const message of paymentMessages) {
+      if (
+        message?.source &&
+        sameAddress(
+          message.destination,
+          order.payment_address
+        )
+      ) {
+        source = message.source;
+        break;
+      }
+    }
+
+    if (!source) {
+      throw new Error(
+        `Unable to resolve payout destination for order ${order.id}`
+      );
+    }
+
+    order.payout_destination =
+      source;
+  }
+
+  if (
+    order.status ===
+    "payment_confirmed"
+  ) {
+    const claimed =
+      await claimPayoutProcessing(
+        env,
+        order.id
+      );
+
+    if (!claimed) {
+      return;
+    }
+
+    order.status =
+      "payout_processing";
+  }
+
+  if (
+    order.status !==
+    "payout_processing"
+  ) {
+    return;
+  }
+
+  const result =
+    await sendPtnPayout(
+      env,
+      order
+    );
+
+  if (!result.success) {
+    throw new Error(
+      `PTN payout failed for order ${order.id}`
+    );
+  }
+
+  const marked =
+    await markPayoutSent(
+      env,
+      order.id,
+      result.hash
+    );
+
+  if (!marked) {
+    throw new Error(
+      `Could not mark payout_sent for order ${order.id}`
+    );
+  }
+
+  console.log(
+    "PAYOUT CONFIRMED:",
     {
-      chat_id:
-        message.chat.id,
-
-      message_id:
-        message.message_id,
-
-      text,
-
-      reply_markup:
-        replyMarkup
+      orderId: order.id,
+      ptnAmount: order.ptn_amount,
+      destination:
+        order.payout_destination,
+      payoutHash: result.hash
     }
   );
+
+  try {
+    await sendTelegramMessage(
+      env,
+      order.telegram_id,
+      `PTN payout completed successfully.\n\nOrder: #${order.id}\nGRAM: ${order.gram_amount}\nPTN: ${order.ptn_amount}\n\nTransaction:\n${result.hash}`
+    );
+  } catch (error) {
+    console.error(
+      "PAYOUT TELEGRAM ERROR:",
+      error
+    );
+  }
+}
+
+async function processOrders(env) {
+  const orders =
+    await getPendingOrders(env);
+
+  if (!orders.length) {
+    console.log(
+      "NO ORDERS TO PROCESS"
+    );
+
+    return;
+  }
+
+  console.log(
+    "ORDERS FOUND:",
+    orders.length
+  );
+
+  const ambiguousMap =
+    buildAmbiguousMap(orders);
+
+  for (const order of orders) {
+    try {
+      if (
+        order.status === "pending"
+      ) {
+        await processPendingOrder(
+          env,
+          order,
+          ambiguousMap
+        );
+      }
+
+      if (
+        order.status ===
+          "payment_confirmed" ||
+        order.status ===
+          "payout_processing"
+      ) {
+        if (
+          !order.payout_destination
+        ) {
+          order.payout_destination =
+            null;
+        }
+
+        await processPayoutOrder(
+          env,
+          order
+        );
+      }
+    } catch (error) {
+      console.error(
+        "ORDER PROCESSING ERROR:",
+        {
+          orderId: order.id,
+          status: order.status,
+          error:
+            error instanceof Error
+              ? error.message
+              : String(error)
+        }
+      );
+    }
+  }
 }
