@@ -5,15 +5,13 @@ import {
   beginCell,
   internal,
   SendMode,
-  toNano,
-  Cell
+  toNano
 } from "@ton/core";
 
 import {
   TonClient,
   WalletContractV5R1,
-  JettonMaster,
-  JettonWallet
+  JettonMaster
 } from "@ton/ton";
 
 globalThis.Buffer = Buffer;
@@ -2311,7 +2309,8 @@ async function processOrders(env) {
       FROM orders
       WHERE status IN (
         'pending',
-        'payment_verified'
+        'payment_verified',
+        'processing'
       )
       ORDER BY id ASC
       LIMIT 20
@@ -2339,21 +2338,7 @@ async function processOrders(env) {
         /*
           Duplicate transaction protection.
         */
-        const alreadyUsed =
-          await env.DB.prepare(`
-            SELECT *
-            FROM orders
-            WHERE transaction_hash=?
-            AND id!=?
-            LIMIT 1
-          `)
-            .bind(
-              payment.hash,
-              order.id
-            )
-            .first();
-
-        if (alreadyUsed) {
+        if (payment.duplicate) {
           const user =
             await env.DB.prepare(`
               SELECT username
@@ -2458,8 +2443,7 @@ async function processOrders(env) {
       }
 
       /*
-        payment_verified orders skip payment
-        verification and go directly to payout.
+        Reload the order after payment verification.
       */
       const latestOrder =
         await env.DB.prepare(`
@@ -2471,17 +2455,29 @@ async function processOrders(env) {
           .bind(order.id)
           .first();
 
+      if (!latestOrder) {
+        continue;
+      }
+
+      /*
+        Only verified/processing orders enter
+        the payout stage.
+      */
       if (
-        !latestOrder ||
         latestOrder.status !==
-          "payment_verified"
+          "payment_verified" &&
+        latestOrder.status !==
+          "processing"
       ) {
         continue;
       }
 
       /*
-        Check whether this order was already
-        sent before retrying the payout.
+        Check for an already submitted payout.
+
+        This protects against duplicate payouts
+        if the Worker stopped after broadcasting
+        the transaction but before updating D1.
       */
       const existingPayout =
         await findExistingPayoutForOrder(
@@ -2494,6 +2490,10 @@ async function processOrders(env) {
           UPDATE orders
           SET status='payout_sent'
           WHERE id=?
+          AND status IN (
+            'payment_verified',
+            'processing'
+          )
         `)
           .bind(latestOrder.id)
           .run();
@@ -2516,23 +2516,46 @@ async function processOrders(env) {
       }
 
       /*
-        Mark as processing before sending.
-        This prevents the order from being
-        treated as a fresh payment.
+        Mark the order as processing before
+        submitting the blockchain transaction.
       */
       await env.DB.prepare(`
         UPDATE orders
         SET status='processing'
         WHERE id=?
-        AND status='payment_verified'
+        AND status IN (
+          'payment_verified',
+          'processing'
+        )
       `)
         .bind(latestOrder.id)
         .run();
 
+      /*
+        Reload after locking the payout state.
+      */
+      const processingOrder =
+        await env.DB.prepare(`
+          SELECT *
+          FROM orders
+          WHERE id=?
+          LIMIT 1
+        `)
+          .bind(latestOrder.id)
+          .first();
+
+      if (
+        !processingOrder ||
+        processingOrder.status !==
+          "processing"
+      ) {
+        continue;
+      }
+
       const payout =
         await sendPTN(
           env,
-          latestOrder
+          processingOrder
         );
 
       if (payout?.success) {
@@ -2540,8 +2563,11 @@ async function processOrders(env) {
           UPDATE orders
           SET status='payout_sent'
           WHERE id=?
+          AND status='processing'
         `)
-          .bind(latestOrder.id)
+          .bind(
+            processingOrder.id
+          )
           .run();
 
         await telegram(
@@ -2549,11 +2575,11 @@ async function processOrders(env) {
           "sendMessage",
           {
             chat_id:
-              latestOrder.telegram_id,
+              processingOrder.telegram_id,
             text:
               "🎉 Order completed successfully!\n\n" +
-              `Order #${latestOrder.id}\n` +
-              `${formatNumber(latestOrder.ptn_amount)} PTN has been sent to your wallet.\n\n` +
+              `Order #${processingOrder.id}\n` +
+              `${formatNumber(processingOrder.ptn_amount)} PTN has been sent to your wallet.\n\n` +
               "The PTN transfer has been submitted to the blockchain."
           }
         );
@@ -2568,13 +2594,17 @@ async function processOrders(env) {
           WHERE id=?
           AND status='processing'
         `)
-          .bind(latestOrder.id)
+          .bind(
+            processingOrder.id
+          )
           .run();
 
         console.error(
-          `PTN payout failed for order ${latestOrder.id}. Retry will occur automatically.`
+          `PTN payout failed for order ${processingOrder.id}:`,
+          payout?.error || "Unknown error"
         );
       }
+
     } catch (error) {
       console.error(
         `ORDER ${order.id} ERROR:`,
@@ -2582,9 +2612,8 @@ async function processOrders(env) {
       );
 
       /*
-        If an unexpected error happened after
-        payment verification, restore the order
-        to the silent retry state.
+        Restore verified orders to a retryable state.
+        No user failure message is sent.
       */
       try {
         const current =
@@ -2605,6 +2634,7 @@ async function processOrders(env) {
             UPDATE orders
             SET status='payment_verified'
             WHERE id=?
+            AND status='processing'
           `)
             .bind(order.id)
             .run();
@@ -2794,8 +2824,8 @@ async function findPayment(
     }
 
     /*
-      The GRAM payment must originate
-      from the wallet registered by the user.
+      Match the payment to the registered
+      source wallet.
     */
     if (
       !sameAddress(
@@ -2807,11 +2837,12 @@ async function findPayment(
     }
 
     /*
-      The GRAM payment must arrive at
-      our configured receiving wallet.
+      If TON Center provides a destination,
+      verify it. Some transaction responses
+      may omit this field.
     */
     if (
-      !destination ||
+      destination &&
       !sameAddress(
         destination,
         GRAM_RECEIVING_WALLET
@@ -2820,10 +2851,6 @@ async function findPayment(
       continue;
     }
 
-    /*
-      The amount must exactly match
-      the order amount in nanoGRAM.
-    */
     try {
       if (
         String(rawValue) === ""
@@ -2846,8 +2873,8 @@ async function findPayment(
     }
 
     /*
-      The transaction must have happened
-      after the order was created.
+      The transaction must be recent enough
+      for this order.
     */
     if (createdAt) {
       const txUtime =
@@ -2876,8 +2903,8 @@ async function findPayment(
     }
 
     /*
-      Make sure this transaction has not
-      already been assigned to another order.
+      Prevent one transaction from being
+      assigned to multiple orders.
     */
     const existing =
       await env.DB.prepare(`
@@ -2980,6 +3007,9 @@ async function sendPTN(
           env.TONCENTER_API_KEY
       });
 
+    /*
+      Create the exact V5R1 sender wallet.
+    */
     const senderWallet =
       WalletContractV5R1.create({
         workchain: 0,
@@ -2991,11 +3021,15 @@ async function sendPTN(
       });
 
     /*
-      The mnemonic must derive the exact
-      configured sender wallet.
+      Security check:
+      the mnemonic must derive the configured
+      PTN sender wallet.
     */
+    const derivedAddress =
+      senderWallet.address.toString();
+
     if (
-      senderWallet.address.toString() !==
+      derivedAddress !==
       PTN_SENDER_WALLET
     ) {
       throw new Error(
@@ -3008,6 +3042,9 @@ async function sendPTN(
         senderWallet
       );
 
+    /*
+      Make sure the TON sender wallet exists.
+    */
     const deployed =
       await client.isContractDeployed(
         senderWallet.address
@@ -3019,20 +3056,26 @@ async function sendPTN(
       );
     }
 
-    const balance =
+    /*
+      Check native TON balance.
+    */
+    const tonBalance =
       await client.getBalance(
         senderWallet.address
       );
 
     if (
-      balance <
+      tonBalance <
       MIN_SENDER_TON_BALANCE
     ) {
       throw new Error(
-        "Insufficient native TON balance for PTN payout"
+        `Insufficient TON balance. Current balance: ${tonBalance.toString()} nanoTON`
       );
     }
 
+    /*
+      Open the PTN Jetton master.
+    */
     const master =
       client.open(
         JettonMaster.create(
@@ -3042,16 +3085,23 @@ async function sendPTN(
         )
       );
 
-    const senderJettonWallet =
-      client.open(
-        await master.getWalletAddress(
-          senderWallet.address
-        )
+    /*
+      Get the PTN Jetton Wallet belonging
+      to the sender wallet.
+    */
+    const senderJettonWalletAddress =
+      await master.getWalletAddress(
+        senderWallet.address
       );
 
-    const senderJettonBalance =
-      await senderJettonWallet.getJettonBalance();
+    const senderJettonWallet =
+      client.open(
+        senderJettonWalletAddress
+      );
 
+    /*
+      Calculate PTN amount in smallest units.
+    */
     const amount =
       BigInt(
         order.ptn_amount
@@ -3061,36 +3111,73 @@ async function sendPTN(
       );
 
     if (
-      senderJettonBalance <
-      amount
+      amount <= 0n
     ) {
       throw new Error(
-        "Insufficient PTN balance"
+        "Invalid PTN payout amount"
       );
     }
 
     /*
-      payment_address is the user's
-      registered TON wallet and also
-      the PTN destination wallet.
+      Check PTN balance before sending.
     */
+    const senderJettonBalance =
+      await senderJettonWallet.getJettonBalance();
+
+    console.log(
+      "PTN BALANCE CHECK:",
+      JSON.stringify({
+        orderId:
+          order.id,
+        balance:
+          senderJettonBalance.toString(),
+        required:
+          amount.toString()
+      })
+    );
+
+    if (
+      senderJettonBalance <
+      amount
+    ) {
+      throw new Error(
+        `Insufficient PTN balance. Available: ${senderJettonBalance.toString()}, required: ${amount.toString()}`
+      );
+    }
+
+    /*
+      The user's registered wallet is the
+      PTN destination.
+    */
+    if (!order.payment_address) {
+      throw new Error(
+        "Order payment wallet is missing"
+      );
+    }
+
     const destination =
       Address.parse(
         order.payment_address
       );
 
-    const destinationJettonWallet =
-      await master.getWalletAddress(
-        destination
+    if (
+      destination.workChain !== 0
+    ) {
+      throw new Error(
+        "PTN destination must be a basechain wallet"
       );
+    }
 
     /*
-      The query ID is tied to the order ID.
-      This allows payout idempotency checks.
+      Use the order ID as the unique Jetton
+      transfer query ID.
     */
     const queryId =
       BigInt(order.id);
 
+    /*
+      Standard Jetton transfer body.
+    */
     const transferBody =
       beginCell()
         .storeUint(
@@ -3120,6 +3207,33 @@ async function sendPTN(
     const seqno =
       await senderContract.getSeqno();
 
+    console.log(
+      "PTN TRANSFER PREPARED:",
+      JSON.stringify({
+        orderId:
+          order.id,
+        seqno,
+        sender:
+          senderWallet.address.toString(),
+        senderJettonWallet:
+          senderJettonWalletAddress.toString(),
+        destination:
+          destination.toString(),
+        amount:
+          amount.toString(),
+        queryId:
+          queryId.toString()
+      })
+    );
+
+    /*
+      IMPORTANT:
+      The TON wallet sends the Jetton transfer
+      message to the SENDER'S Jetton Wallet.
+
+      The sender Jetton Wallet then performs
+      the actual PTN transfer to the user.
+    */
     await senderContract.sendTransfer({
       seqno,
       secretKey:
@@ -3129,7 +3243,7 @@ async function sendPTN(
       messages: [
         internal({
           to:
-            destinationJettonWallet,
+            senderJettonWalletAddress,
           value:
             PTN_TRANSFER_TON,
           body:
@@ -3139,7 +3253,7 @@ async function sendPTN(
     });
 
     console.log(
-      `PTN payout submitted for order ${order.id}, seqno ${seqno}`
+      `PTN payout submitted successfully for order ${order.id}, seqno ${seqno}`
     );
 
     return {
@@ -3155,7 +3269,7 @@ async function sendPTN(
     );
 
     /*
-      No Telegram message is sent here.
+      No Telegram failure message is sent here.
       The order processor will retry silently.
     */
     return {
@@ -3241,6 +3355,7 @@ async function findExistingPayoutForOrder(
       senderWallet.address,
       BigInt(order.id)
     );
+
   } catch (error) {
     console.error(
       "PAYOUT IDEMPOTENCY ERROR:",
