@@ -1,4 +1,5 @@
 import { Buffer } from "buffer";
+
 import {
   Address,
   beginCell,
@@ -6,6 +7,7 @@ import {
   SendMode,
   toNano
 } from "@ton/core";
+
 import {
   TonClient,
   WalletContractV5R1,
@@ -17,7 +19,7 @@ globalThis.window = globalThis;
 
 /* =========================================================
    PAYTON CONFIG
-========================================================= */
+   ========================================================= */
 
 const WELCOME = `🦊 Welcome to PAYTON (PTN)
 
@@ -46,7 +48,7 @@ const BACK = {
 
 /* =========================================================
    ADMIN
-========================================================= */
+   ========================================================= */
 
 const ADMIN_TELEGRAM_ID = "113074274";
 
@@ -78,7 +80,7 @@ const ADMIN_BACK = {
 
 /* =========================================================
    PRESALE CONFIG
-========================================================= */
+   ========================================================= */
 
 const PTN_MASTER =
   "EQAZ_Rw9M91opByfYz1edG0TbeAKP72WcdccprkZvbvPVkAZ";
@@ -96,9 +98,38 @@ const MIN_SENDER_TON_BALANCE = toNano("0.10");
 const PTN_TRANSFER_TON = toNano("0.05");
 const PTN_FORWARD_TON = toNano("0.01");
 
+/*
+  CPU protection.
+  Keep these numbers intentionally small.
+*/
+const MAX_ORDERS_PER_RUN = 5;
+const MAX_PAYOUTS_PER_RUN = 1;
+const PAYMENT_TX_LIMIT = 25;
+const PAYOUT_TX_LIMIT = 20;
+
+/*
+  Processing lock timeout.
+  If Worker crashes after acquiring the lock,
+  another run can retry after this period.
+*/
+const PAYOUT_LOCK_MINUTES = 10;
+
+/* =========================================================
+   RUNTIME CACHE
+   ========================================================= */
+
+/*
+  Cloudflare may reuse the same isolate.
+  Avoid recalculating the mnemonic/key for every order.
+*/
+let ptnRuntimePromise = null;
+
+const addressCache = new Map();
+const ADDRESS_CACHE_LIMIT = 500;
+
 /* =========================================================
    SUPPORT QUICK REPLIES
-========================================================= */
+   ========================================================= */
 
 const QUICK_REPLIES = [
   "⏳ Please wait while your transaction is being verified.",
@@ -124,113 +155,28 @@ const QUICK_REPLIES = [
 ];
 
 /* =========================================================
-   PTN RUNTIME CACHE
-========================================================= */
-
-let ptnRuntimeCache = null;
-
-async function getPtnRuntime(env) {
-  const mnemonic = String(env.PTN_MNEMONIC || "").trim();
-  const apiKey = String(env.TONCENTER_API_KEY || "").trim();
-
-  if (!mnemonic) {
-    throw new Error("PTN_MNEMONIC missing");
-  }
-
-  if (!apiKey) {
-    throw new Error("TONCENTER_API_KEY missing");
-  }
-
-  if (
-    ptnRuntimeCache &&
-    ptnRuntimeCache.mnemonic === mnemonic &&
-    ptnRuntimeCache.apiKey === apiKey
-  ) {
-    return ptnRuntimeCache;
-  }
-
-  const words = mnemonic.split(/\s+/);
-
-  const {
-    mnemonicToPrivateKey,
-    mnemonicValidate
-  } = await import("@ton/crypto");
-
-  const validMnemonic = await mnemonicValidate(words);
-
-  if (!validMnemonic) {
-    throw new Error("Invalid PTN sender mnemonic");
-  }
-
-  const keyPair = await mnemonicToPrivateKey(words);
-
-  const client = new TonClient({
-    endpoint: "https://toncenter.com/api/v2/jsonRPC",
-    apiKey
-  });
-
-  const senderWallet = WalletContractV5R1.create({
-    workchain: 0,
-    publicKey: keyPair.publicKey,
-    walletId: {
-      networkGlobalId: -239
-    }
-  });
-
-  const derivedAddress = senderWallet.address.toString();
-
-  if (derivedAddress !== PTN_SENDER_WALLET) {
-    throw new Error(
-      "Derived sender wallet does not match configured PTN sender wallet"
-    );
-  }
-
-  const senderContract = client.open(senderWallet);
-
-  const master = client.open(
-    JettonMaster.create(Address.parse(PTN_MASTER))
-  );
-
-  const senderJettonWalletAddress =
-    await master.getWalletAddress(senderWallet.address);
-
-  const senderJettonWallet =
-    client.open(senderJettonWalletAddress);
-
-  ptnRuntimeCache = {
-    mnemonic,
-    apiKey,
-    keyPair,
-    client,
-    senderWallet,
-    senderContract,
-    senderJettonWallet,
-    senderJettonWalletAddress
-  };
-
-  return ptnRuntimeCache;
-}
-
-/* =========================================================
    MAIN FETCH
-========================================================= */
+   ========================================================= */
 
 export default {
   async fetch(request, env, ctx) {
     if (request.method !== "POST") {
-      return new Response("PAYTON BOT OK", {
-        status: 200
-      });
+      return new Response("PAYTON BOT OK", { status: 200 });
     }
+
+    /*
+      IMPORTANT:
+      Database table creation is NOT performed here anymore.
+      Doing CREATE TABLE on every Telegram update was unnecessary
+      work and increased D1 activity.
+    */
 
     let update;
 
     try {
       update = await request.json();
     } catch {
-      return new Response("OK", {
-        status: 200
-      });
+      return new Response("OK", { status: 200 });
     }
 
     try {
@@ -239,13 +185,17 @@ export default {
       console.error("UPDATE ERROR:", error);
     }
 
-    return new Response("OK", {
-      status: 200
-    });
+    return new Response("OK", { status: 200 });
   },
 
   async scheduled(event, env, ctx) {
     try {
+      /*
+        Extra tables/indexes are checked only during Cron.
+        They are not touched by normal Telegram requests.
+      */
+      await ensureExtraTables(env);
+
       await processOrders(env);
     } catch (error) {
       console.error("CRON ERROR:", error);
@@ -255,9 +205,13 @@ export default {
 
 /* =========================================================
    EXTRA TABLES
-========================================================= */
+   ========================================================= */
 
 async function ensureExtraTables(env) {
+  /*
+    These tables are only initialized during scheduled processing.
+  */
+
   await env.DB.prepare(`
     CREATE TABLE IF NOT EXISTS support_messages (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -291,11 +245,62 @@ async function ensureExtraTables(env) {
       updated_at TEXT DEFAULT CURRENT_TIMESTAMP
     )
   `).run();
+
+  /*
+    Lock table prevents two Worker invocations from
+    sending the same PTN payout simultaneously.
+  */
+  await env.DB.prepare(`
+    CREATE TABLE IF NOT EXISTS payout_locks (
+      order_id INTEGER PRIMARY KEY,
+      locked_until TEXT NOT NULL,
+      created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    )
+  `).run();
+
+  /*
+    Useful indexes.
+    If orders/users already exist, these improve lookup speed.
+  */
+  await env.DB.prepare(`
+    CREATE INDEX IF NOT EXISTS idx_orders_status
+    ON orders(status)
+  `).run();
+
+  await env.DB.prepare(`
+    CREATE INDEX IF NOT EXISTS idx_orders_telegram_status
+    ON orders(telegram_id, status)
+  `).run();
+
+  await env.DB.prepare(`
+    CREATE INDEX IF NOT EXISTS idx_orders_transaction_hash
+    ON orders(transaction_hash)
+  `).run();
+
+  await env.DB.prepare(`
+    CREATE INDEX IF NOT EXISTS idx_orders_created_status
+    ON orders(created_at, status)
+  `).run();
+
+  await env.DB.prepare(`
+    CREATE INDEX IF NOT EXISTS idx_support_status
+    ON support_messages(status)
+  `).run();
+
+  await env.DB.prepare(`
+    CREATE INDEX IF NOT EXISTS idx_support_telegram_status
+    ON support_messages(telegram_id, status)
+  `).run();
+
+  await env.DB.prepare(`
+    CREATE INDEX IF NOT EXISTS idx_suspicious_updated
+    ON suspicious_users(updated_at)
+  `).run();
 }
 
 /* =========================================================
    UPDATE HANDLER
-========================================================= */
+   ========================================================= */
 
 async function handleUpdate(update, env, ctx) {
   if (update.callback_query) {
@@ -333,12 +338,7 @@ async function handleUpdate(update, env, ctx) {
     const restriction = await getUserRestriction(env, chatId);
 
     if (restriction) {
-      await sendBlockedMessage(
-        env,
-        chatId,
-        restriction
-      );
-
+      await sendBlockedMessage(env, chatId, restriction);
       return;
     }
   }
@@ -363,16 +363,10 @@ async function handleUpdate(update, env, ctx) {
   }
 
   if (chatId !== ADMIN_TELEGRAM_ID) {
-    const state =
-      await getPendingOrder(env, chatId);
+    const state = await getPendingOrder(env, chatId);
 
     if (state) {
-      await handleOrderText(
-        message,
-        state,
-        env
-      );
-
+      await handleOrderText(message, state, env);
       return;
     }
 
@@ -388,25 +382,20 @@ async function handleUpdate(update, env, ctx) {
 
 /* =========================================================
    CALLBACK HANDLER
-========================================================= */
+   ========================================================= */
 
 async function handleCallback(query, env) {
   const data = String(query.data || "");
-  const chatId =
-    String(query.message?.chat?.id || "");
+  const chatId = String(query.message?.chat?.id || "");
 
   if (!chatId) return;
 
   if (data.startsWith("admin_")) {
     if (chatId !== ADMIN_TELEGRAM_ID) {
-      await telegram(
-        env,
-        "answerCallbackQuery",
-        {
-          callback_query_id: query.id,
-          text: "Access denied."
-        }
-      );
+      await telegram(env, "answerCallbackQuery", {
+        callback_query_id: query.id,
+        text: "Access denied."
+      });
 
       return;
     }
@@ -419,15 +408,10 @@ async function handleCallback(query, env) {
     await getUserRestriction(env, chatId);
 
   if (restriction) {
-    await telegram(
-      env,
-      "answerCallbackQuery",
-      {
-        callback_query_id: query.id,
-        text:
-          "Your access to this bot is currently restricted."
-      }
-    );
+    await telegram(env, "answerCallbackQuery", {
+      callback_query_id: query.id,
+      text: "Your access to this bot is currently restricted."
+    });
 
     await sendBlockedMessage(
       env,
@@ -438,30 +422,17 @@ async function handleCallback(query, env) {
     return;
   }
 
-  await telegram(
-    env,
-    "answerCallbackQuery",
-    {
-      callback_query_id: query.id
-    }
-  );
+  await telegram(env, "answerCallbackQuery", {
+    callback_query_id: query.id
+  });
 
   if (data === "home") {
-    await editMessage(
-      env,
-      query,
-      WELCOME,
-      MENU
-    );
-
+    await editMessage(env, query, WELCOME, MENU);
     return;
   }
 
   if (data === "buy") {
-    await upsertUser(
-      env,
-      query.from
-    );
+    await upsertUser(env, query.from);
 
     await telegram(env, "sendMessage", {
       chat_id: chatId,
@@ -495,19 +466,12 @@ async function handleCallback(query, env) {
   }
 
   if (data === "orders") {
-    await showUserOrders(
-      env,
-      query
-    );
-
+    await showUserOrders(env, query);
     return;
   }
 
   if (data === "support") {
-    await createSupportRequest(
-      env,
-      query.from
-    );
+    await createSupportRequest(env, query.from);
 
     await editMessage(
       env,
@@ -515,23 +479,21 @@ async function handleCallback(query, env) {
       "💬 Support\n\nPlease send your message now.\n\nOur support team will review your message and reply to you.",
       BACK
     );
+
+    return;
   }
 }
 
 /* =========================================================
    ADMIN CALLBACK HANDLER
-========================================================= */
+   ========================================================= */
 
 async function handleAdminCallback(query, env) {
   const data = String(query.data || "");
 
-  await telegram(
-    env,
-    "answerCallbackQuery",
-    {
-      callback_query_id: query.id
-    }
-  );
+  await telegram(env, "answerCallbackQuery", {
+    callback_query_id: query.id
+  });
 
   if (data === "admin_home") {
     await editMessage(
@@ -540,7 +502,6 @@ async function handleAdminCallback(query, env) {
       "🛠 PAYTON Admin Panel",
       ADMIN_MENU
     );
-
     return;
   }
 
@@ -586,22 +547,10 @@ async function handleAdminCallback(query, env) {
 
   if (data.startsWith("admin_ticket_")) {
     const id =
-      Number(
-        data.replace(
-          "admin_ticket_",
-          ""
-        )
-      );
+      Number(data.replace("admin_ticket_", ""));
 
-    if (
-      Number.isInteger(id) &&
-      id > 0
-    ) {
-      await showSupportTicket(
-        env,
-        query,
-        id
-      );
+    if (Number.isInteger(id) && id > 0) {
+      await showSupportTicket(env, query, id);
     }
 
     return;
@@ -609,17 +558,9 @@ async function handleAdminCallback(query, env) {
 
   if (data.startsWith("admin_reply_")) {
     const id =
-      Number(
-        data.replace(
-          "admin_reply_",
-          ""
-        )
-      );
+      Number(data.replace("admin_reply_", ""));
 
-    if (
-      Number.isInteger(id) &&
-      id > 0
-    ) {
+    if (Number.isInteger(id) && id > 0) {
       await setAdminState(
         env,
         "reply",
@@ -635,8 +576,7 @@ async function handleAdminCallback(query, env) {
             [
               {
                 text: "❌ Cancel",
-                callback_data:
-                  "admin_cancel_reply"
+                callback_data: "admin_cancel_reply"
               }
             ]
           ]
@@ -664,11 +604,8 @@ async function handleAdminCallback(query, env) {
     const parts = data.split("_");
 
     if (parts.length >= 4) {
-      const ticketId =
-        Number(parts[2]);
-
-      const page =
-        Number(parts[3] || 0);
+      const ticketId = Number(parts[2]);
+      const page = Number(parts[3] || 0);
 
       if (
         Number.isInteger(ticketId) &&
@@ -690,11 +627,8 @@ async function handleAdminCallback(query, env) {
     const parts = data.split("_");
 
     if (parts.length >= 4) {
-      const ticketId =
-        Number(parts[2]);
-
-      const index =
-        Number(parts[3]);
+      const ticketId = Number(parts[2]);
+      const index = Number(parts[3]);
 
       if (
         Number.isInteger(ticketId) &&
@@ -715,10 +649,7 @@ async function handleAdminCallback(query, env) {
 
   if (data.startsWith("admin_sus_")) {
     const telegramId =
-      data.replace(
-        "admin_sus_",
-        ""
-      );
+      data.replace("admin_sus_", "");
 
     if (telegramId) {
       await showSuspiciousUser(
@@ -733,11 +664,8 @@ async function handleAdminCallback(query, env) {
 
   if (data.startsWith("admin_block_")) {
     const parts = data.split("_");
-
     const type = parts[2];
-
-    const telegramId =
-      parts.slice(3).join("_");
+    const telegramId = parts.slice(3).join("_");
 
     if (telegramId) {
       await blockSuspiciousUser(
@@ -753,10 +681,7 @@ async function handleAdminCallback(query, env) {
 
   if (data.startsWith("admin_unblock_")) {
     const telegramId =
-      data.replace(
-        "admin_unblock_",
-        ""
-      );
+      data.replace("admin_unblock_", "");
 
     if (telegramId) {
       await unblockSuspiciousUser(
@@ -770,12 +695,11 @@ async function handleAdminCallback(query, env) {
 
 /* =========================================================
    ADMIN TEXT
-========================================================= */
+   ========================================================= */
 
 async function handleAdminText(message, env) {
   const chatId = ADMIN_TELEGRAM_ID;
-  const text =
-    String(message.text || "").trim();
+  const text = String(message.text || "").trim();
 
   if (!text) return false;
 
@@ -791,14 +715,12 @@ async function handleAdminText(message, env) {
     return true;
   }
 
-  const state =
-    await getAdminState(env);
+  const state = await getAdminState(env);
 
   if (!state) return false;
 
   if (state.mode === "reply") {
-    const ticketId =
-      Number(state.target_id);
+    const ticketId = Number(state.target_id);
 
     if (!ticketId) {
       await clearAdminState(env);
@@ -842,10 +764,7 @@ async function handleAdminText(message, env) {
           admin_reply=?
       WHERE id=?
     `)
-      .bind(
-        text,
-        ticketId
-      )
+      .bind(text, ticketId)
       .run();
 
     await clearAdminState(env);
@@ -864,11 +783,10 @@ async function handleAdminText(message, env) {
 
 /* =========================================================
    SUPPORT
-========================================================= */
+   ========================================================= */
 
 async function createSupportRequest(env, user) {
-  const telegramId =
-    String(user.id);
+  const telegramId = String(user.id);
 
   const username =
     user.username
@@ -987,14 +905,11 @@ async function showSupportInbox(env, query) {
       WHERE status='open'
       ORDER BY id DESC
       LIMIT 20
-    `)
-      .all();
+    `).all();
 
   const buttons = [];
 
-  for (
-    const row of rows.results || []
-  ) {
+  for (const row of rows.results || []) {
     const name =
       row.username ||
       row.telegram_id;
@@ -1071,10 +986,7 @@ async function showSupportTicket(
     `Telegram ID: ${ticket.telegram_id}\n` +
     `Status: ${ticket.status}\n\n` +
     "Message:\n" +
-    shortText(
-      ticket.message,
-      3000
-    );
+    shortText(ticket.message, 3000);
 
   await editMessage(
     env,
@@ -1110,7 +1022,7 @@ async function showSupportTicket(
 
 /* =========================================================
    QUICK REPLIES
-========================================================= */
+   ========================================================= */
 
 async function showQuickReplies(
   env,
@@ -1147,15 +1059,15 @@ async function showQuickReplies(
       pageSize
     );
 
-  if (page < 0) page = 0;
+  page = Math.max(
+    0,
+    Math.min(
+      Number(page) || 0,
+      totalPages - 1
+    )
+  );
 
-  if (page >= totalPages) {
-    page = totalPages - 1;
-  }
-
-  const start =
-    page * pageSize;
-
+  const start = page * pageSize;
   const end =
     Math.min(
       start + pageSize,
@@ -1164,11 +1076,7 @@ async function showQuickReplies(
 
   const buttons = [];
 
-  for (
-    let i = start;
-    i < end;
-    i++
-  ) {
+  for (let i = start; i < end; i++) {
     buttons.push([
       {
         text:
@@ -1266,10 +1174,7 @@ async function sendQuickReply(
         admin_reply=?
     WHERE id=?
   `)
-    .bind(
-      reply,
-      ticketId
-    )
+    .bind(reply, ticketId)
     .run();
 
   await editMessage(
@@ -1298,8 +1203,7 @@ async function sendQuickReply(
 }
 
 async function showTemplates(env, query) {
-  let text =
-    "⚡ Reply Templates\n\n";
+  let text = "⚡ Reply Templates\n\n";
 
   QUICK_REPLIES.forEach(
     (reply, index) => {
@@ -1318,7 +1222,7 @@ async function showTemplates(env, query) {
 
 /* =========================================================
    SUSPICIOUS USERS
-========================================================= */
+   ========================================================= */
 
 async function flagSuspicious(
   env,
@@ -1360,14 +1264,11 @@ async function showSuspiciousUsers(env, query) {
       FROM suspicious_users
       ORDER BY updated_at DESC
       LIMIT 30
-    `)
-      .all();
+    `).all();
 
   const buttons = [];
 
-  for (
-    const row of rows.results || []
-  ) {
+  for (const row of rows.results || []) {
     let status = "⚠️";
 
     if (Number(row.permanent) === 1) {
@@ -1396,8 +1297,7 @@ async function showSuspiciousUsers(env, query) {
   buttons.push([
     {
       text: "⬅️ Admin Panel",
-      callback_data:
-        "admin_home"
+      callback_data: "admin_home"
     }
   ]);
 
@@ -1638,7 +1538,7 @@ async function unblockSuspiciousUser(
 
 /* =========================================================
    BLOCK CHECK
-========================================================= */
+   ========================================================= */
 
 async function getUserRestriction(
   env,
@@ -1664,14 +1564,9 @@ async function getUserRestriction(
 
   if (row.blocked_until) {
     const until =
-      parseSqlUtc(
-        row.blocked_until
-      );
+      parseSqlUtc(row.blocked_until);
 
-    if (
-      until &&
-      until > Date.now()
-    ) {
+    if (until && until > Date.now()) {
       return {
         permanent: false,
         blockedUntil:
@@ -1734,7 +1629,7 @@ async function sendBlockedMessage(
 
 /* =========================================================
    ADMIN DASHBOARD
-========================================================= */
+   ========================================================= */
 
 async function showAdminDashboard(
   env,
@@ -1851,7 +1746,7 @@ async function getAdminStats(env) {
 
 /* =========================================================
    ADMIN ORDERS
-========================================================= */
+   ========================================================= */
 
 async function showAdminOrders(
   env,
@@ -1868,9 +1763,7 @@ async function showAdminOrders(
   let text =
     "📋 Recent Orders\n\n";
 
-  for (
-    const row of rows.results || []
-  ) {
+  for (const row of rows.results || []) {
     text +=
       `#${row.id} | ${row.telegram_id}\n` +
       `GRAM: ${row.gram_amount}\n` +
@@ -1912,9 +1805,7 @@ async function showAdminPending(
   let text =
     "⏳ Pending / Under Review\n\n";
 
-  for (
-    const row of rows.results || []
-  ) {
+  for (const row of rows.results || []) {
     text +=
       `#${row.id}\n` +
       `User: ${row.telegram_id}\n` +
@@ -1950,9 +1841,7 @@ async function showAdminUsers(
   let text =
     "👥 Users\n\n";
 
-  for (
-    const row of rows.results || []
-  ) {
+  for (const row of rows.results || []) {
     text +=
       `ID: ${row.telegram_id}\n` +
       `Username: ${row.username || "No username"}\n` +
@@ -2012,7 +1901,7 @@ async function showAdminRevenue(
 
 /* =========================================================
    USERS
-========================================================= */
+   ========================================================= */
 
 async function upsertUser(env, user) {
   if (!user?.id) return;
@@ -2036,7 +1925,7 @@ async function upsertUser(env, user) {
 
 /* =========================================================
    ORDER STATE
-========================================================= */
+   ========================================================= */
 
 async function setOrderState(
   env,
@@ -2193,7 +2082,7 @@ async function handleOrderText(
 
 /* =========================================================
    USER ORDERS
-========================================================= */
+   ========================================================= */
 
 async function showUserOrders(
   env,
@@ -2220,9 +2109,7 @@ async function showUserOrders(
     text +=
       "You do not have any orders yet.";
   } else {
-    for (
-      const row of rows.results
-    ) {
+    for (const row of rows.results) {
       text +=
         `Order #${row.id}\n` +
         `GRAM: ${formatNumber(row.gram_amount)}\n` +
@@ -2241,17 +2128,16 @@ async function showUserOrders(
 }
 
 /* =========================================================
-   ORDER PROCESSOR
-========================================================= */
+   ORDER PROCESSOR - CPU OPTIMIZED
+   ========================================================= */
 
 async function processOrders(env) {
   /*
-   Process only one order per Cron execution.
-   This significantly reduces CPU and prevents
-   large batches from exceeding the Cron CPU budget.
+    Process only a small batch per Cron.
+    This prevents a backlog from causing one invocation
+    to parse hundreds of blockchain transactions.
   */
-
-  const order =
+  const rows =
     await env.DB.prepare(`
       SELECT *
       FROM orders
@@ -2261,234 +2147,254 @@ async function processOrders(env) {
         'processing'
       )
       ORDER BY id ASC
-      LIMIT 1
-    `).first();
+      LIMIT ?
+    `)
+      .bind(MAX_ORDERS_PER_RUN)
+      .all();
 
-  if (!order) return;
+  let payoutsThisRun = 0;
 
-  try {
-    let currentOrder = order;
-    let newlyVerified = false;
-
-    /*
-     * Pending orders:
-     * Find an exact incoming GRAM payment.
-     */
-    if (currentOrder.status === "pending") {
-      const payment =
-        await findPayment(
-          env,
-          currentOrder
-        );
-
-      if (!payment) {
-        return;
-      }
-
+  for (const order of rows.results || []) {
+    try {
       /*
-       * Reused transaction protection.
-       */
-      if (payment.duplicate) {
-        const user =
+        -----------------------------------------------------
+        PAYMENT VERIFICATION
+        -----------------------------------------------------
+      */
+      if (order.status === "pending") {
+        const payment =
+          await findPayment(
+            env,
+            order
+          );
+
+        if (!payment) {
+          continue;
+        }
+
+        if (payment.duplicate) {
+          const user =
+            await env.DB.prepare(`
+              SELECT username
+              FROM users
+              WHERE telegram_id=?
+              LIMIT 1
+            `)
+              .bind(order.telegram_id)
+              .first();
+
+          await flagSuspicious(
+            env,
+            order.telegram_id,
+            user?.username || null,
+            "Reused transaction hash on another order"
+          );
+
           await env.DB.prepare(`
-            SELECT username
-            FROM users
-            WHERE telegram_id=?
-            LIMIT 1
+            UPDATE orders
+            SET transaction_hash=?,
+                status='suspicious'
+            WHERE id=?
+            AND status='pending'
           `)
             .bind(
-              currentOrder.telegram_id
+              payment.hash,
+              order.id
             )
-            .first();
+            .run();
 
-        await flagSuspicious(
-          env,
-          currentOrder.telegram_id,
-          user?.username || null,
-          "Reused transaction hash on another order"
-        );
-
-        await env.DB.prepare(`
-          UPDATE orders
-          SET transaction_hash=?,
-              status='suspicious'
-          WHERE id=?
-          AND status='pending'
-        `)
-          .bind(
-            payment.hash,
-            currentOrder.id
-          )
-          .run();
-
-        await telegram(
-          env,
-          "sendMessage",
-          {
-            chat_id:
-              currentOrder.telegram_id,
-            text:
-              "⚠️ This transaction has already been used.\n\n" +
-              "Your order has been flagged for review.\n\n" +
-              "Please do not send another payment."
-          }
-        );
-
-        await telegram(
-          env,
-          "sendMessage",
-          {
-            chat_id:
-              ADMIN_TELEGRAM_ID,
-            text:
-              "🚨 Suspicious activity detected.\n\n" +
-              `User: ${currentOrder.telegram_id}\n` +
-              `Order: #${currentOrder.id}\n` +
-              "Reason: Reused transaction hash",
-            reply_markup: {
-              inline_keyboard: [
-                [
-                  {
-                    text: "🚨 Review User",
-                    callback_data:
-                      `admin_sus_${currentOrder.telegram_id}`
-                  }
-                ]
-              ]
+          await telegram(
+            env,
+            "sendMessage",
+            {
+              chat_id:
+                order.telegram_id,
+              text:
+                "⚠️ This transaction has already been used.\n\n" +
+                "Your order has been flagged for review.\n\n" +
+                "Please do not send another payment."
             }
+          );
+
+          await telegram(
+            env,
+            "sendMessage",
+            {
+              chat_id:
+                ADMIN_TELEGRAM_ID,
+              text:
+                "🚨 Suspicious activity detected.\n\n" +
+                `User: ${order.telegram_id}\n` +
+                `Order: #${order.id}\n` +
+                "Reason: Reused transaction hash",
+              reply_markup: {
+                inline_keyboard: [
+                  [
+                    {
+                      text:
+                        "🚨 Review User",
+                      callback_data:
+                        `admin_sus_${order.telegram_id}`
+                    }
+                  ]
+                ]
+              }
+            }
+          );
+
+          continue;
+        }
+
+        /*
+          Atomically claim the transaction for this order.
+          If another invocation already claimed it,
+          this UPDATE does nothing.
+        */
+        const paymentClaim =
+          await env.DB.prepare(`
+            UPDATE orders
+            SET transaction_hash=?,
+                status='payment_verified'
+            WHERE id=?
+            AND status='pending'
+            AND transaction_hash IS NULL
+          `)
+            .bind(
+              payment.hash,
+              order.id
+            )
+            .run();
+
+        if (
+          Number(paymentClaim?.meta?.changes || 0) !== 1
+        ) {
+          continue;
+        }
+
+        await telegram(
+          env,
+          "sendMessage",
+          {
+            chat_id:
+              order.telegram_id,
+            text:
+              "✅ Payment verified successfully.\n\n" +
+              `Order #${order.id}\n` +
+              `GRAM received: ${formatNumber(order.gram_amount)}\n` +
+              `PTN amount: ${formatNumber(order.ptn_amount)}\n\n` +
+              "Your PTN tokens are now being sent automatically."
           }
         );
-
-        return;
       }
 
       /*
-       * Atomically claim the payment verification.
-       * If another Cron already handled it,
-       * this execution stops.
-       */
-      const verified =
+        Reload current order.
+      */
+      const latestOrder =
         await env.DB.prepare(`
-          UPDATE orders
-          SET transaction_hash=?,
-              status='payment_verified'
+          SELECT *
+          FROM orders
           WHERE id=?
-          AND status='pending'
+          LIMIT 1
         `)
-          .bind(
-            payment.hash,
-            currentOrder.id
-          )
-          .run();
+          .bind(order.id)
+          .first();
+
+      if (!latestOrder) {
+        continue;
+      }
 
       if (
-        !verified.meta ||
-        Number(verified.meta.changes || 0) !== 1
+        latestOrder.status !== "payment_verified" &&
+        latestOrder.status !== "processing"
       ) {
-        return;
+        continue;
       }
 
-      currentOrder = {
-        ...currentOrder,
-        transaction_hash: payment.hash,
-        status: "payment_verified"
-      };
+      /*
+        -----------------------------------------------------
+        PROCESSING ORDER
+        -----------------------------------------------------
 
-      newlyVerified = true;
+        A processing order means a previous Worker may have
+        already broadcast the PTN transaction.
 
-      await telegram(
-        env,
-        "sendMessage",
-        {
-          chat_id:
-            currentOrder.telegram_id,
-          text:
-            "✅ Payment verified successfully.\n\n" +
-            `Order #${currentOrder.id}\n` +
-            `GRAM received: ${formatNumber(currentOrder.gram_amount)}\n` +
-            `PTN amount: ${formatNumber(currentOrder.ptn_amount)}\n\n` +
-            "Your PTN tokens are now being sent automatically."
+        Only these orders need the expensive blockchain
+        idempotency search.
+      */
+      if (
+        latestOrder.status === "processing"
+      ) {
+        const lock =
+          await claimPayoutLock(
+            env,
+            latestOrder.id
+          );
+
+        if (!lock) {
+          continue;
         }
-      );
-    }
 
-    /*
-     * Only payment_verified and processing
-     * orders can reach payout.
-     */
-    if (
-      currentOrder.status !==
-        "payment_verified" &&
-      currentOrder.status !==
-        "processing"
-    ) {
-      return;
-    }
+        try {
+          const existingPayout =
+            await findExistingPayoutForOrder(
+              env,
+              latestOrder
+            );
 
-    /*
-     * Existing processing orders must first
-     * be checked for an already broadcast payout.
-     *
-     * Newly verified orders do not need this
-     * extra blockchain scan because no payout
-     * could have existed before this order
-     * entered payout processing.
-     */
-    if (!newlyVerified) {
-      const existingCheck =
-        await findExistingPayoutForOrder(
-          env,
-          currentOrder
-        );
+          if (existingPayout) {
+            await env.DB.prepare(`
+              UPDATE orders
+              SET status='payout_sent'
+              WHERE id=?
+              AND status='processing'
+            `)
+              .bind(latestOrder.id)
+              .run();
 
-      if (existingCheck.error) {
-        console.error(
-          `PAYOUT IDEMPOTENCY CHECK FAILED FOR ORDER ${currentOrder.id}`
-        );
+            await telegram(
+              env,
+              "sendMessage",
+              {
+                chat_id:
+                  latestOrder.telegram_id,
+                text:
+                  "🎉 Order completed successfully!\n\n" +
+                  `Order #${latestOrder.id}\n` +
+                  `${formatNumber(latestOrder.ptn_amount)} PTN has been sent to your wallet.\n\n` +
+                  "The PTN transfer has already been submitted to the blockchain."
+              }
+            );
 
-        return;
-      }
-
-      if (existingCheck.found) {
-        await env.DB.prepare(`
-          UPDATE orders
-          SET status='payout_sent'
-          WHERE id=?
-          AND status IN (
-            'payment_verified',
-            'processing'
-          )
-        `)
-          .bind(currentOrder.id)
-          .run();
-
-        await telegram(
-          env,
-          "sendMessage",
-          {
-            chat_id:
-              currentOrder.telegram_id,
-            text:
-              "🎉 Order completed successfully!\n\n" +
-              `Order #${currentOrder.id}\n` +
-              `${formatNumber(currentOrder.ptn_amount)} PTN has been sent to your wallet.\n\n` +
-              "The PTN transfer has already been submitted to the blockchain."
+            continue;
           }
-        );
 
-        return;
+          /*
+            No previous payout was found.
+            We can safely retry.
+          */
+        } finally {
+          /*
+            Keep the lock briefly for crash recovery,
+            but release it after this invocation finishes
+            checking the blockchain.
+          */
+          await releasePayoutLock(
+            env,
+            latestOrder.id
+          );
+        }
       }
-    }
 
-    /*
-     * Atomically claim the payout state.
-     * This prevents two Cron executions from
-     * simultaneously starting a new payout.
-     */
-    if (
-      currentOrder.status ===
-      "payment_verified"
-    ) {
+      /*
+        -----------------------------------------------------
+        PAYOUT CLAIM
+        -----------------------------------------------------
+
+        payment_verified -> processing is atomic.
+        This prevents two simultaneous Cron invocations
+        from both sending PTN for the same order.
+      */
       const claim =
         await env.DB.prepare(`
           UPDATE orders
@@ -2496,97 +2402,233 @@ async function processOrders(env) {
           WHERE id=?
           AND status='payment_verified'
         `)
-          .bind(currentOrder.id)
+          .bind(latestOrder.id)
           .run();
 
+      /*
+        If the order was already processing, it is only
+        eligible here if we intentionally retry it above.
+      */
+      let processingOrder = null;
+
       if (
-        !claim.meta ||
-        Number(claim.meta.changes || 0) !== 1
+        Number(claim?.meta?.changes || 0) === 1
       ) {
-        return;
+        processingOrder =
+          await env.DB.prepare(`
+            SELECT *
+            FROM orders
+            WHERE id=?
+            LIMIT 1
+          `)
+            .bind(latestOrder.id)
+            .first();
+      } else if (
+        latestOrder.status === "processing"
+      ) {
+        /*
+          If it was already processing, we do not send again
+          in the same pass after the idempotency check.
+        */
+        continue;
       }
 
-      currentOrder = {
-        ...currentOrder,
-        status: "processing"
-      };
-    }
+      if (
+        !processingOrder ||
+        processingOrder.status !== "processing"
+      ) {
+        continue;
+      }
 
-    if (
-      currentOrder.status !==
-      "processing"
-    ) {
-      return;
-    }
+      /*
+        Hard CPU protection:
+        one payout maximum per Cron invocation.
+      */
+      if (
+        payoutsThisRun >= MAX_PAYOUTS_PER_RUN
+      ) {
+        /*
+          Leave it as processing.
+          Next Cron will continue it.
+        */
+        continue;
+      }
 
-    /*
-     * Submit PTN payout.
-     */
-    const payout =
-      await sendPTN(
-        env,
-        currentOrder
-      );
+      const payoutLock =
+        await claimPayoutLock(
+          env,
+          processingOrder.id
+        );
 
-    if (payout?.success) {
-      await env.DB.prepare(`
-        UPDATE orders
-        SET status='payout_sent'
-        WHERE id=?
-        AND status='processing'
-      `)
-        .bind(currentOrder.id)
-        .run();
+      if (!payoutLock) {
+        continue;
+      }
 
-      await telegram(
-        env,
-        "sendMessage",
-        {
-          chat_id:
-            currentOrder.telegram_id,
-          text:
-            "🎉 Order completed successfully!\n\n" +
-            `Order #${currentOrder.id}\n` +
-            `${formatNumber(currentOrder.ptn_amount)} PTN has been sent to your wallet.\n\n` +
-            "The PTN transfer has been submitted to the blockchain."
+      try {
+        payoutsThisRun++;
+
+        const payout =
+          await sendPTN(
+            env,
+            processingOrder
+          );
+
+        if (payout?.success) {
+          await env.DB.prepare(`
+            UPDATE orders
+            SET status='payout_sent'
+            WHERE id=?
+            AND status='processing'
+          `)
+            .bind(
+              processingOrder.id
+            )
+            .run();
+
+          await telegram(
+            env,
+            "sendMessage",
+            {
+              chat_id:
+                processingOrder.telegram_id,
+              text:
+                "🎉 Order completed successfully!\n\n" +
+                `Order #${processingOrder.id}\n` +
+                `${formatNumber(processingOrder.ptn_amount)} PTN has been sent to your wallet.\n\n` +
+                "The PTN transfer has been submitted to the blockchain."
+            }
+          );
+        } else {
+          await env.DB.prepare(`
+            UPDATE orders
+            SET status='payment_verified'
+            WHERE id=?
+            AND status='processing'
+          `)
+            .bind(
+              processingOrder.id
+            )
+            .run();
+
+          console.error(
+            `PTN payout failed for order ${processingOrder.id}:`,
+            payout?.error || "Unknown error"
+          );
         }
+      } finally {
+        await releasePayoutLock(
+          env,
+          processingOrder.id
+        );
+      }
+
+    } catch (error) {
+      console.error(
+        `ORDER ${order.id} ERROR:`,
+        error
       );
 
-      return;
+      try {
+        const current =
+          await env.DB.prepare(`
+            SELECT status
+            FROM orders
+            WHERE id=?
+            LIMIT 1
+          `)
+            .bind(order.id)
+            .first();
+
+        if (
+          current?.status === "processing"
+        ) {
+          await env.DB.prepare(`
+            UPDATE orders
+            SET status='payment_verified'
+            WHERE id=?
+            AND status='processing'
+          `)
+            .bind(order.id)
+            .run();
+        }
+      } catch (restoreError) {
+        console.error(
+          "ORDER STATE RESTORE ERROR:",
+          restoreError
+        );
+      }
     }
-
-    /*
-     * IMPORTANT:
-     * Do not reset processing -> payment_verified.
-     *
-     * If the blockchain transaction was actually
-     * broadcast but the Worker failed before receiving
-     * confirmation, the next Cron will first run the
-     * idempotency check.
-     *
-     * If no payout exists, it will retry safely.
-     */
-    console.error(
-      `PTN payout failed for order ${currentOrder.id}:`,
-      payout?.error || "Unknown error"
-    );
-  } catch (error) {
-    console.error(
-      `ORDER ${order.id} ERROR:`,
-      error
-    );
-
-    /*
-     * Keep processing state intact.
-     * The next Cron will perform the payout
-     * idempotency check before retrying.
-     */
   }
 }
 
 /* =========================================================
-   PAYMENT SEARCH
-========================================================= */
+   PAYOUT LOCKS
+   ========================================================= */
+
+async function claimPayoutLock(
+  env,
+  orderId
+) {
+  try {
+    const result =
+      await env.DB.prepare(`
+        INSERT INTO payout_locks
+        (
+          order_id,
+          locked_until
+        )
+        VALUES (
+          ?,
+          datetime('now', ?)
+        )
+        ON CONFLICT(order_id)
+        DO UPDATE SET
+          locked_until=
+            datetime('now', ?)
+        WHERE payout_locks.locked_until <= CURRENT_TIMESTAMP
+      `)
+        .bind(
+          Number(orderId),
+          `+${PAYOUT_LOCK_MINUTES} minutes`,
+          `+${PAYOUT_LOCK_MINUTES} minutes`
+        )
+        .run();
+
+    return (
+      Number(result?.meta?.changes || 0) === 1
+    );
+  } catch (error) {
+    console.error(
+      "PAYOUT LOCK ERROR:",
+      error
+    );
+
+    return false;
+  }
+}
+
+async function releasePayoutLock(
+  env,
+  orderId
+) {
+  try {
+    await env.DB.prepare(`
+      DELETE FROM payout_locks
+      WHERE order_id=?
+    `)
+      .bind(Number(orderId))
+      .run();
+  } catch (error) {
+    console.error(
+      "PAYOUT LOCK RELEASE ERROR:",
+      error
+    );
+  }
+}
+
+/* =========================================================
+   PAYMENT SEARCH - CPU OPTIMIZED
+   ========================================================= */
 
 async function findPayment(
   env,
@@ -2608,23 +2650,20 @@ async function findPayment(
   }
 
   const createdAt =
-    parseSqlUtc(
-      order.created_at
-    );
+    parseSqlUtc(order.created_at);
 
   const startUtime =
     createdAt
       ? Math.max(
           0,
-          Math.floor(
-            createdAt / 1000
-          ) - 120
+          Math.floor(createdAt / 1000) - 120
         )
       : null;
 
-  const url = new URL(
-    "https://toncenter.com/api/v3/transactions"
-  );
+  const url =
+    new URL(
+      "https://toncenter.com/api/v3/transactions"
+    );
 
   url.searchParams.set(
     "account",
@@ -2632,12 +2671,13 @@ async function findPayment(
   );
 
   /*
-   * 50 is enough for normal operation
-   * and reduces response parsing/CPU.
-   */
+    Reduced from 100.
+    This dramatically reduces JSON parsing and
+    JavaScript object processing.
+  */
   url.searchParams.set(
     "limit",
-    "50"
+    String(PAYMENT_TX_LIMIT)
   );
 
   url.searchParams.set(
@@ -2655,14 +2695,16 @@ async function findPayment(
   let response;
 
   try {
-    response = await fetch(
-      url.toString(),
-      {
-        headers: {
-          "X-API-Key": apiKey
+    response =
+      await fetch(
+        url.toString(),
+        {
+          headers: {
+            "X-API-Key":
+              apiKey
+          }
         }
-      }
-    );
+      );
   } catch (error) {
     console.error(
       "TONCENTER FETCH ERROR:",
@@ -2684,7 +2726,8 @@ async function findPayment(
   let data;
 
   try {
-    data = await response.json();
+    data =
+      await response.json();
   } catch (error) {
     console.error(
       "TONCENTER JSON ERROR:",
@@ -2697,11 +2740,13 @@ async function findPayment(
   const transactions =
     Array.isArray(data)
       ? data
-      : Array.isArray(
-          data.transactions
-        )
+      : Array.isArray(data.transactions)
         ? data.transactions
         : [];
+
+  if (!transactions.length) {
+    return null;
+  }
 
   const expectedAmount =
     gramToNano(
@@ -2709,13 +2754,21 @@ async function findPayment(
     );
 
   const registeredWallet =
-    String(
-      order.payment_address
-    ).trim();
+    normalizeAddress(
+      String(order.payment_address).trim()
+    );
 
-  for (
-    const tx of transactions
-  ) {
+  if (!registeredWallet) {
+    return null;
+  }
+
+  /*
+    First filter everything locally.
+    No D1 query is made for each transaction anymore.
+  */
+  const candidates = [];
+
+  for (const tx of transactions) {
     const hash =
       tx.hash ||
       tx.transaction_hash ||
@@ -2733,37 +2786,23 @@ async function findPayment(
       inMsg.source_address ||
       "";
 
+    if (!source) continue;
+
+    const normalizedSource =
+      normalizeAddress(source);
+
+    if (
+      !normalizedSource ||
+      normalizedSource !== registeredWallet
+    ) {
+      continue;
+    }
+
     const destination =
       inMsg.destination ||
       inMsg.destination_address ||
       "";
 
-    const rawValue =
-      inMsg.value ??
-      inMsg.amount ??
-      "";
-
-    if (!source) {
-      continue;
-    }
-
-    /*
-     * Payment must originate from the
-     * wallet registered on the order.
-     */
-    if (
-      !sameAddress(
-        source,
-        registeredWallet
-      )
-    ) {
-      continue;
-    }
-
-    /*
-     * If destination exists, it must be
-     * the configured GRAM receiving wallet.
-     */
     if (
       destination &&
       !sameAddress(
@@ -2774,17 +2813,20 @@ async function findPayment(
       continue;
     }
 
+    const rawValue =
+      inMsg.value ??
+      inMsg.amount ??
+      "";
+
+    if (
+      String(rawValue) === ""
+    ) {
+      continue;
+    }
+
     try {
       if (
-        String(rawValue) === ""
-      ) {
-        continue;
-      }
-
-      if (
-        BigInt(
-          String(rawValue)
-        ) !==
+        BigInt(String(rawValue)) !==
         BigInt(expectedAmount)
       ) {
         continue;
@@ -2793,10 +2835,6 @@ async function findPayment(
       continue;
     }
 
-    /*
-     * Transaction must not be older
-     * than the order creation window.
-     */
     if (createdAt) {
       const txUtime =
         Number(
@@ -2806,9 +2844,7 @@ async function findPayment(
         );
 
       if (
-        Number.isFinite(
-          txUtime
-        ) &&
+        Number.isFinite(txUtime) &&
         txUtime > 0
       ) {
         const txTime =
@@ -2823,28 +2859,63 @@ async function findPayment(
       }
     }
 
-    /*
-     * Prevent the same transaction hash
-     * from being assigned to another order.
-     */
-    const existing =
+    candidates.push(hash);
+  }
+
+  if (!candidates.length) {
+    return null;
+  }
+
+  /*
+    Check all candidate hashes with ONE D1 query.
+  */
+  const placeholders =
+    candidates
+      .map(() => "?")
+      .join(",");
+
+  let existingRows;
+
+  try {
+    existingRows =
       await env.DB.prepare(`
-        SELECT id
+        SELECT id, transaction_hash
         FROM orders
-        WHERE transaction_hash=?
-        LIMIT 1
+        WHERE transaction_hash IN (${placeholders})
       `)
-        .bind(hash)
-        .first();
+        .bind(...candidates)
+        .all();
+  } catch (error) {
+    console.error(
+      "PAYMENT HASH CHECK ERROR:",
+      error
+    );
+
+    return null;
+  }
+
+  const existingByHash =
+    new Map();
+
+  for (
+    const row of existingRows.results || []
+  ) {
+    existingByHash.set(
+      String(row.transaction_hash),
+      row
+    );
+  }
+
+  for (const hash of candidates) {
+    const existing =
+      existingByHash.get(hash);
 
     if (existing) {
       if (
         Number(existing.id) ===
         Number(order.id)
       ) {
-        return {
-          hash
-        };
+        return { hash };
       }
 
       return {
@@ -2857,24 +2928,122 @@ async function findPayment(
       "PAYMENT MATCHED:",
       JSON.stringify({
         orderId: order.id,
-        source,
-        destination,
-        value: String(rawValue),
         hash
       })
     );
 
-    return {
-      hash
-    };
+    return { hash };
   }
 
   return null;
 }
 
 /* =========================================================
+   PTN RUNTIME CACHE
+   ========================================================= */
+
+async function getPtnRuntime(env) {
+  if (ptnRuntimePromise) {
+    return ptnRuntimePromise;
+  }
+
+  ptnRuntimePromise =
+    (async () => {
+      const mnemonic =
+        env.PTN_MNEMONIC;
+
+      if (!mnemonic) {
+        throw new Error(
+          "PTN_MNEMONIC missing"
+        );
+      }
+
+      const words =
+        mnemonic
+          .trim()
+          .split(/\s+/);
+
+      const {
+        mnemonicToPrivateKey,
+        mnemonicValidate
+      } = await import(
+        "@ton/crypto"
+      );
+
+      const validMnemonic =
+        await mnemonicValidate(words);
+
+      if (!validMnemonic) {
+        throw new Error(
+          "Invalid PTN sender mnemonic"
+        );
+      }
+
+      const keyPair =
+        await mnemonicToPrivateKey(words);
+
+      const senderWallet =
+        WalletContractV5R1.create({
+          workchain: 0,
+          publicKey:
+            keyPair.publicKey,
+          walletId: {
+            networkGlobalId: -239
+          }
+        });
+
+      const derivedAddress =
+        senderWallet.address.toString();
+
+      if (
+        derivedAddress !==
+        PTN_SENDER_WALLET
+      ) {
+        throw new Error(
+          "Derived sender wallet does not match configured PTN sender wallet"
+        );
+      }
+
+      const client =
+        new TonClient({
+          endpoint:
+            "https://toncenter.com/api/v2/jsonRPC",
+          apiKey:
+            env.TONCENTER_API_KEY
+        });
+
+      const senderContract =
+        client.open(senderWallet);
+
+      const master =
+        client.open(
+          JettonMaster.create(
+            Address.parse(PTN_MASTER)
+          )
+        );
+
+      return {
+        words,
+        keyPair,
+        senderWallet,
+        client,
+        senderContract,
+        master
+      };
+    })().catch(error => {
+      /*
+        Allow retry if initialization failed.
+      */
+      ptnRuntimePromise = null;
+      throw error;
+    });
+
+  return ptnRuntimePromise;
+}
+
+/* =========================================================
    SEND PTN
-========================================================= */
+   ========================================================= */
 
 async function sendPTN(
   env,
@@ -2886,16 +3055,15 @@ async function sendPTN(
 
     const {
       keyPair,
-      client,
       senderWallet,
+      client,
       senderContract,
-      senderJettonWallet,
-      senderJettonWalletAddress
+      master
     } = runtime;
 
     /*
-     * Make sure the TON sender wallet exists.
-     */
+      Check sender wallet deployment.
+    */
     const deployed =
       await client.isContractDeployed(
         senderWallet.address
@@ -2908,8 +3076,8 @@ async function sendPTN(
     }
 
     /*
-     * Check TON balance.
-     */
+      Check native TON balance.
+    */
     const tonBalance =
       await client.getBalance(
         senderWallet.address
@@ -2925,13 +3093,21 @@ async function sendPTN(
     }
 
     /*
-     * Calculate PTN amount in smallest units.
-     */
+      Get sender Jetton wallet.
+    */
+    const senderJettonWalletAddress =
+      await master.getWalletAddress(
+        senderWallet.address
+      );
+
+    const senderJettonWallet =
+      client.open(
+        senderJettonWalletAddress
+      );
+
     const amount =
       BigInt(order.ptn_amount) *
-      10n ** BigInt(
-        PTN_DECIMALS
-      );
+      10n ** BigInt(PTN_DECIMALS);
 
     if (amount <= 0n) {
       throw new Error(
@@ -2940,21 +3116,10 @@ async function sendPTN(
     }
 
     /*
-     * Check PTN balance.
-     */
+      Check PTN balance.
+    */
     const senderJettonBalance =
       await senderJettonWallet.getJettonBalance();
-
-    console.log(
-      "PTN BALANCE CHECK:",
-      JSON.stringify({
-        orderId: order.id,
-        balance:
-          senderJettonBalance.toString(),
-        required:
-          amount.toString()
-      })
-    );
 
     if (
       senderJettonBalance <
@@ -2965,10 +3130,6 @@ async function sendPTN(
       );
     }
 
-    /*
-     * User's registered wallet is the
-     * PTN destination.
-     */
     if (!order.payment_address) {
       throw new Error(
         "Order payment wallet is missing"
@@ -2988,16 +3149,9 @@ async function sendPTN(
       );
     }
 
-    /*
-     * Order ID is used as the unique
-     * Jetton transfer query ID.
-     */
     const queryId =
       BigInt(order.id);
 
-    /*
-     * Standard Jetton transfer body.
-     */
     const transferBody =
       beginCell()
         .storeUint(
@@ -3030,12 +3184,9 @@ async function sendPTN(
     console.log(
       "PTN TRANSFER PREPARED:",
       JSON.stringify({
-        orderId: order.id,
+        orderId:
+          order.id,
         seqno,
-        sender:
-          senderWallet.address.toString(),
-        senderJettonWallet:
-          senderJettonWalletAddress.toString(),
         destination:
           destination.toString(),
         amount:
@@ -3045,13 +3196,6 @@ async function sendPTN(
       })
     );
 
-    /*
-     * The TON wallet sends the Jetton transfer
-     * message to the sender's Jetton Wallet.
-     *
-     * The sender Jetton Wallet then transfers
-     * the actual PTN tokens to the user.
-     */
     await senderContract.sendTransfer({
       seqno,
       secretKey:
@@ -3079,17 +3223,13 @@ async function sendPTN(
       hash: null,
       seqno
     };
+
   } catch (error) {
     console.error(
       `PTN PAYOUT ERROR ORDER ${order.id}:`,
       error
     );
 
-    /*
-     * No Telegram failure message.
-     * Order remains in processing and will
-     * be checked/retried by the next Cron.
-     */
     return {
       success: false,
       error:
@@ -3103,7 +3243,7 @@ async function sendPTN(
 
 /* =========================================================
    PAYOUT IDEMPOTENCY
-========================================================= */
+   ========================================================= */
 
 async function findExistingPayoutForOrder(
   env,
@@ -3113,34 +3253,24 @@ async function findExistingPayoutForOrder(
     const runtime =
       await getPtnRuntime(env);
 
-    const result =
-      await findExistingPayout(
-        runtime.client,
-        runtime.senderWallet.address,
-        BigInt(order.id)
-      );
+    return await findExistingPayout(
+      runtime.client,
+      runtime.senderWallet.address,
+      BigInt(order.id)
+    );
 
-    return {
-      found: result,
-      error: false
-    };
   } catch (error) {
     console.error(
       "PAYOUT IDEMPOTENCY ERROR:",
       error
     );
 
-    return {
-      found: null,
-      error: true
-    };
+    return null;
   }
 }
 
 function getOutgoingMessages(tx) {
-  if (!tx) {
-    return [];
-  }
+  if (!tx) return [];
 
   if (
     tx.outMessages &&
@@ -3153,17 +3283,14 @@ function getOutgoingMessages(tx) {
   }
 
   if (
-    Array.isArray(
-      tx.outMessages
-    )
+    Array.isArray(tx.outMessages)
   ) {
     return tx.outMessages;
   }
 
   if (
     tx.outMessages &&
-    typeof tx.outMessages ===
-      "object"
+    typeof tx.outMessages === "object"
   ) {
     return Object.values(
       tx.outMessages
@@ -3178,77 +3305,85 @@ async function findExistingPayout(
   senderAddress,
   queryId
 ) {
-  const transactions =
-    await client.getTransactions(
-      senderAddress,
-      {
-        limit: 50
-      }
-    );
+  try {
+    /*
+      Reduced from 50 to 20.
+      This is only used for orders already marked
+      processing, not for every payment.
+    */
+    const transactions =
+      await client.getTransactions(
+        senderAddress,
+        {
+          limit: PAYOUT_TX_LIMIT
+        }
+      );
 
-  for (
-    const tx of transactions
-  ) {
-    const outgoing =
-      getOutgoingMessages(tx);
+    for (const tx of transactions) {
+      const outgoing =
+        getOutgoingMessages(tx);
 
-    for (
-      const message of outgoing
-    ) {
-      if (!message?.body) {
-        continue;
-      }
-
-      try {
-        const slice =
-          message.body.beginParse();
-
-        if (
-          slice.remainingBits <
-          96
-        ) {
+      for (const message of outgoing) {
+        if (!message?.body) {
           continue;
         }
-
-        const opcode =
-          slice.loadUint(32);
-
-        if (
-          opcode !==
-          0x0f8a7ea5
-        ) {
-          continue;
-        }
-
-        const id =
-          slice.loadUintBig(64);
-
-        if (id !== queryId) {
-          continue;
-        }
-
-        let hash = null;
 
         try {
-          hash =
-            tx
-              .hash()
-              .toString(
+          const slice =
+            message.body.beginParse();
+
+          if (
+            slice.remainingBits <
+            96
+          ) {
+            continue;
+          }
+
+          const opcode =
+            slice.loadUint(32);
+
+          if (
+            opcode !==
+            0x0f8a7ea5
+          ) {
+            continue;
+          }
+
+          const id =
+            slice.loadUintBig(64);
+
+          if (id !== queryId) {
+            continue;
+          }
+
+          let hash = null;
+
+          try {
+            hash =
+              tx.hash().toString(
                 "base64url"
               );
-        } catch {
-          hash = null;
-        }
+          } catch {
+            hash = null;
+          }
 
-        return {
-          hash,
-          seqno:
-            tx.lt || null
-        };
-      } catch {
-        continue;
+          return {
+            hash,
+            seqno:
+              tx.lt || null
+          };
+
+        } catch {
+          continue;
+        }
       }
     }
+
+  } catch (error) {
+    console.error(
+      "PAYOUT SEARCH ERROR:",
+      error
+    );
   }
 
   return null;
@@ -3256,7 +3391,7 @@ async function findExistingPayout(
 
 /* =========================================================
    ADMIN STATE
-========================================================= */
+   ========================================================= */
 
 async function setAdminState(
   env,
@@ -3306,8 +3441,59 @@ async function clearAdminState(env) {
 }
 
 /* =========================================================
+   ADDRESS CACHE
+   ========================================================= */
+
+function normalizeAddress(value) {
+  if (!value) return null;
+
+  const input =
+    String(value).trim();
+
+  if (!input) return null;
+
+  const cached =
+    addressCache.get(input);
+
+  if (cached !== undefined) {
+    return cached;
+  }
+
+  let normalized = null;
+
+  try {
+    normalized =
+      Address.parse(input).toString();
+  } catch {
+    normalized = null;
+  }
+
+  /*
+    Keep cache bounded.
+  */
+  if (
+    addressCache.size >=
+    ADDRESS_CACHE_LIMIT
+  ) {
+    const first =
+      addressCache.keys().next().value;
+
+    if (first !== undefined) {
+      addressCache.delete(first);
+    }
+  }
+
+  addressCache.set(
+    input,
+    normalized
+  );
+
+  return normalized;
+}
+
+/* =========================================================
    HELPERS
-========================================================= */
+   ========================================================= */
 
 function parseGramAmount(value) {
   const input =
@@ -3315,13 +3501,8 @@ function parseGramAmount(value) {
       .trim()
       .replace(",", ".");
 
-  /*
-   * GRAM supports up to 6 decimal places
-   * because gramToPtn converts GRAM to
-   * whole PTN using 1,000,000 PTN per GRAM.
-   */
   if (
-    !/^\d+(\.\d{1,6})?$/.test(
+    !/^\d+(\.\d{1,9})?$/.test(
       input
     )
   ) {
@@ -3408,14 +3589,22 @@ function formatNumber(value) {
 
 function displayStatus(status) {
   const map = {
-    pending: "Pending payment",
-    awaiting_amount: "Awaiting amount",
-    awaiting_wallet: "Awaiting wallet",
-    payment_verified: "Payment verified",
-    processing: "Processing",
-    payout_sent: "PTN sent",
-    completed: "Completed",
-    suspicious: "Under review"
+    pending:
+      "Pending payment",
+    awaiting_amount:
+      "Awaiting amount",
+    awaiting_wallet:
+      "Awaiting wallet",
+    payment_verified:
+      "Payment verified",
+    processing:
+      "Processing",
+    payout_sent:
+      "PTN sent",
+    completed:
+      "Completed",
+    suspicious:
+      "Under review"
   };
 
   return (
@@ -3446,23 +3635,17 @@ function shortText(
 }
 
 function sameAddress(a, b) {
-  if (!a || !b) {
+  const aa =
+    normalizeAddress(a);
+
+  const bb =
+    normalizeAddress(b);
+
+  if (!aa || !bb) {
     return false;
   }
 
-  try {
-    return (
-      Address.parse(a)
-        .toString() ===
-      Address.parse(b)
-        .toString()
-    );
-  } catch {
-    return (
-      String(a).trim() ===
-      String(b).trim()
-    );
-  }
+  return aa === bb;
 }
 
 function parseSqlUtc(value) {
@@ -3478,7 +3661,8 @@ function parseSqlUtc(value) {
   if (
     raw.endsWith("Z")
   ) {
-    normalized = raw;
+    normalized =
+      raw;
   } else {
     normalized =
       raw.replace(
@@ -3519,7 +3703,7 @@ function formatUtcDate(value) {
 
 /* =========================================================
    TELEGRAM
-========================================================= */
+   ========================================================= */
 
 async function telegram(
   env,
@@ -3537,23 +3721,33 @@ async function telegram(
     return null;
   }
 
-  const response =
-    await fetch(
-      `https://api.telegram.org/bot${token}/${method}`,
-      {
-        method: "POST",
-        headers: {
-          "content-type":
-            "application/json"
-        },
-        body:
-          JSON.stringify(body)
-      }
+  try {
+    const response =
+      await fetch(
+        `https://api.telegram.org/bot${token}/${method}`,
+        {
+          method: "POST",
+          headers: {
+            "content-type":
+              "application/json"
+          },
+          body:
+            JSON.stringify(body)
+        }
+      );
+
+    try {
+      return await response.json();
+    } catch {
+      return null;
+    }
+
+  } catch (error) {
+    console.error(
+      `TELEGRAM ${method} ERROR:`,
+      error
     );
 
-  try {
-    return await response.json();
-  } catch {
     return null;
   }
 }
